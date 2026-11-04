@@ -230,7 +230,7 @@ func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL str
 		return pl
 	}
 
-	skippedCipher := 0
+	skippedCipher, sabrOnly := 0, 0
 	for _, list := range []string{"formats", "adaptiveFormats"} {
 		for _, raw := range ex.Slice(sd, list) {
 			fm, _ := raw.(map[string]any)
@@ -238,6 +238,7 @@ func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL str
 			if u == "" {
 				cipher := ex.FirstStr(fm, ex.P("signatureCipher"), ex.P("cipher"))
 				if cipher == "" {
+					sabrOnly++ // ни URL, ни подписи: формат доступен только через SABR
 					continue
 				}
 				decoded, err := decipherURL(ensurePlayer(), cipher)
@@ -258,6 +259,9 @@ func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL str
 	}
 	if hlsURL := ex.Str(sd, "hlsManifestUrl"); hlsURL != "" {
 		out = append(out, hlsFormats(ctx, env, c, hlsURL)...)
+	}
+	if sabrOnly > 0 && ex.Str(sd, "serverAbrStreamingUrl") != "" {
+		env.Warn("youtube: client returned SABR-only formats (streaming protocol not supported), skipped", "client", c.Name, "count", sabrOnly)
 	}
 	return out
 }

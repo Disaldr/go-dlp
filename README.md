@@ -17,7 +17,7 @@ go install github.com/Disaldr/go-dlp/cmd/go-dlp@latest
 git clone https://github.com/Disaldr/go-dlp && cd go-dlp && go build -o bin/go-dlp ./cmd/go-dlp
 ```
 
-Требуется Go 1.25+. Для слияния видео и аудио и перепаковки HLS нужен [ffmpeg](https://ffmpeg.org/) в `PATH`
+Требуется Go 1.26+. Для слияния видео и аудио и перепаковки HLS нужен [ffmpeg](https://ffmpeg.org/) в `PATH`
 (или `--ffmpeg-location`).
 
 ## CLI
@@ -316,9 +316,10 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
   n-параметра через JS (goja) реализована и для «классических», и для новейших es6-плееров
   (весь код плеера исполняется в goja, функция-подписыватель URL находится структурно). Клиенты
   с шифрованными форматами включаются через `--extractor-args youtube:player_client=web` (или `tv`).
-  Клиент `web` работает в гостевом режиме (без visitor data) — YouTube выдаёт playback-грант без
-  PO Token; надёжность зависит от видео. PO Token как таковой не поддерживается, клиент `tv`
-  возвращает UNPLAYABLE, поэтому `web`/`tv` не включены по умолчанию.
+  Клиент `web` работает в гостевом режиме (без visitor data), но YouTube сейчас отдаёт ему
+  почти все форматы только через SABR (`serverAbrStreamingUrl`, без `url`/`signatureCipher`);
+  SABR не поддерживается, такие форматы пропускаются с предупреждением. PO Token не
+  поддерживается, клиент `tv` возвращает UNPLAYABLE, поэтому `web`/`tv` не включены по умолчанию.
 - DASH: в статических манифестах берётся первый Period, живые — только SegmentTemplate; DRM не поддерживается.
 - Логин по паролю не поддерживается — используйте `--cookies` (Netscape `cookies.txt` или JSON-экспорт
   Cookie-Editor/EditThisCookie) либо `--cookies-from-browser BROWSER[:PROFILE]` (Firefox, Chromium-браузеры
