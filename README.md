@@ -147,12 +147,15 @@ fmt.Println(<-events)
 | X (Twitter) | `twitter` (JS) |
 | TikTok | `tiktok` (JS) |
 | Odysee / LBRY | `odysee` (JS) |
+| TED | `ted` (JS) |
+| Loom | `loom` (JS; HLS-only ролики пока без скачивания) |
 | Telegram | `telegram:embed` (публичные каналы) |
 | Coub | `coub` |
 | Streamable | `streamable` |
 | Internet Archive | `archive.org` |
 | PeerTube | `peertube` (любой инстанс) |
 | 18+ | `xvideos`, `xnxx`, `pornhub`, `redtube`, `youporn`, `xhamster`, `eporner` |
+| Embed-плееры | `brightcove`, `kaltura`, `jwplayer`, `wistia` (JS; передавайте URL самого embed/плеера) |
 | Остальное | `generic`: прямые ссылки, m3u8, mpd, `<video>`, og:video, JSON-LD, iframe-встраивания |
 
 Экстракторы с пометкой «JS» написаны на JavaScript и обновляются без нового релиза
