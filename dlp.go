@@ -61,6 +61,10 @@ type Options struct {
 	// CookiesFile — файл cookies: Netscape cookies.txt (как --cookies в yt-dlp)
 	// или JSON-экспорт расширения браузера (Cookie-Editor, EditThisCookie).
 	CookiesFile string
+	// CookiesFromBrowser — читать cookies из BROWSER[:PROFILE], например
+	// "chrome", "chrome:Profile 1", "firefox:/path/to/profile" или "safari".
+	// При совместном использовании CookiesFile имеет приоритет.
+	CookiesFromBrowser string
 	// Impersonate — имитировать браузер во всех запросах ("any", "chrome", "safari-16.0"...).
 	// Экстракторы могут включать имитацию и для отдельных запросов сами.
 	Impersonate string
@@ -142,6 +146,13 @@ func New(opts Options) (*Client, error) {
 		Args: args, NoPlaylist: opts.NoPlaylist, MaxEntries: opts.PlaylistEnd,
 		Impersonate:  opts.Impersonate,
 		Impersonator: &impersonate.Pool{Jar: hc.Jar, Proxy: proxyFn},
+	}
+	if opts.CookiesFromBrowser != "" {
+		n, err := extractor.LoadCookiesFromBrowser(hc, opts.CookiesFromBrowser)
+		if err != nil {
+			return nil, fmt.Errorf("load browser cookies: %w", err)
+		}
+		c.log.Debug("browser cookies loaded", "count", n)
 	}
 	if opts.CookiesFile != "" {
 		n, err := extractor.LoadCookiesFile(hc, opts.CookiesFile)

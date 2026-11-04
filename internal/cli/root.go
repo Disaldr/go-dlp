@@ -36,6 +36,7 @@ type flags struct {
 	subLangs                              []string
 	listExtractors                        bool
 	cookies                               string
+	cookiesFromBrowser                    string
 	impersonate                           string
 	listImpersonate                       bool
 }
@@ -89,6 +90,7 @@ func NewRootCommand() *cobra.Command {
 	fl.StringVar(&f.userAgent, "user-agent", "", "User-Agent")
 	fl.StringVar(&f.proxy, "proxy", "", "прокси, напр. socks5://127.0.0.1:1080")
 	fl.StringVar(&f.cookies, "cookies", "", "файл cookies: Netscape cookies.txt или JSON-экспорт расширения браузера")
+	fl.StringVar(&f.cookiesFromBrowser, "cookies-from-browser", "", "читать cookies из BROWSER[:PROFILE]: chrome, chromium, firefox, brave, edge, opera, vivaldi, whale, safari")
 	fl.StringVar(&f.impersonate, "impersonate", "", `имитировать браузер во всех запросах: any, chrome, chrome:131, safari, firefox...`)
 	fl.BoolVar(&f.listImpersonate, "list-impersonate-targets", false, "список целей имитации браузера")
 	fl.StringArrayVar(&f.extractorArgs, "extractor-args", nil, `аргументы экстрактора "IE:key=v1,v2;key2=v" (повторяемый)`)
@@ -208,28 +210,29 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 		progress = newProgressPrinter(stderr)
 	}
 	opts := dlp.Options{
-		Format:            f.format,
-		OutputTemplate:    f.output,
-		OutputDir:         f.paths,
-		RestrictFilenames: f.restrict,
-		MergeOutputFormat: f.mergeFormat,
-		Overwrite:         f.forceOverwrites,
-		ExtractorArgs:     eargs,
-		Proxy:             f.proxy,
-		CookiesFile:       f.cookies,
-		Impersonate:       f.impersonate,
-		UserAgent:         f.userAgent,
-		FFmpegLocation:    f.ffmpeg,
-		NoPlaylist:        f.noPlaylist,
-		PlaylistStart:     f.playlistStart,
-		PlaylistEnd:       f.playlistEnd,
-		Retries:           f.retries,
-		Fragments:         f.fragments,
-		ChunkSize:         chunk,
-		RateLimit:         rate,
-		WriteSubtitles:    f.writeSubs,
-		SubtitleLangs:     f.subLangs,
-		Logger:            logger,
+		Format:             f.format,
+		OutputTemplate:     f.output,
+		OutputDir:          f.paths,
+		RestrictFilenames:  f.restrict,
+		MergeOutputFormat:  f.mergeFormat,
+		Overwrite:          f.forceOverwrites,
+		ExtractorArgs:      eargs,
+		Proxy:              f.proxy,
+		CookiesFile:        f.cookies,
+		CookiesFromBrowser: f.cookiesFromBrowser,
+		Impersonate:        f.impersonate,
+		UserAgent:          f.userAgent,
+		FFmpegLocation:     f.ffmpeg,
+		NoPlaylist:         f.noPlaylist,
+		PlaylistStart:      f.playlistStart,
+		PlaylistEnd:        f.playlistEnd,
+		Retries:            f.retries,
+		Fragments:          f.fragments,
+		ChunkSize:          chunk,
+		RateLimit:          rate,
+		WriteSubtitles:     f.writeSubs,
+		SubtitleLangs:      f.subLangs,
+		Logger:             logger,
 	}
 	if progress != nil {
 		opts.Progress = progress.update
