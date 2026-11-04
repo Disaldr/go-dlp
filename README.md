@@ -137,6 +137,9 @@ fmt.Println(<-events)
 | Kick | `kick:live`, `kick:vod`, `kick:clip`, `kick:videos` |
 | VK | `vk` (видео, клипы, embed), `vk:uservideos` (видео сообщества/пользователя, плейлисты) |
 | Mail.ru | `mailru` (JS) |
+| Smotrim (ВГТРК) | `smotrim` (JS; видео, аудио, каналы, бренды) |
+| Первый канал | `firsttv` (JS) |
+| RT | `rt` (JS) |
 | Одноклассники | `odnoklassniki` |
 | Rutube | `rutube`, `rutube:playlist` |
 | SoundCloud | `soundcloud`, `soundcloud:set`, `soundcloud:user` |
