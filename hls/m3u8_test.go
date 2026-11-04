@@ -60,6 +60,20 @@ seg8.ts
 	}
 }
 
+func TestParseMediaRejectsBadByteRange(t *testing.T) {
+	for _, br := range []string{"9223372036854775807@1", "-5", "100@-1", "abc", "2000000000", "10@9223372036854775800"} {
+		body := "#EXTM3U\n#EXT-X-BYTERANGE:" + br + "\n#EXTINF:1,\ns.ts\n"
+		if _, err := ParseMedia(body, "https://e.com/p.m3u8"); err == nil {
+			t.Errorf("byte range %q must be rejected", br)
+		}
+	}
+	ok := "#EXTM3U\n#EXT-X-BYTERANGE:100@0\n#EXTINF:1,\ns.ts\n#EXT-X-BYTERANGE:50\n#EXTINF:1,\ns.ts\n"
+	p, err := ParseMedia(ok, "https://e.com/p.m3u8")
+	if err != nil || p.Segments[1].Offset != 100 || p.Segments[1].Length != 50 {
+		t.Fatalf("valid ranges: %+v %v", p, err)
+	}
+}
+
 func TestParseMediaRejectsLongIV(t *testing.T) {
 	body := "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\",IV=0x" + strings.Repeat("ab", 17) + "\n#EXTINF:1,\ns.ts\n"
 	if _, err := ParseMedia(body, "https://e.com/p.m3u8"); err == nil {

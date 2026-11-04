@@ -5,6 +5,7 @@ package hls
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -307,7 +308,10 @@ func ParseMedia(body, playlistURL string) (*MediaPlaylist, error) {
 			a := ParseAttrs(strings.TrimPrefix(l, "#EXT-X-MAP:"))
 			s := &Segment{URI: resolve(playlistURL, a["URI"]), Key: key}
 			if r := a["BYTERANGE"]; r != "" {
-				s.Length, s.Offset = parseByteRange(r, 0)
+				var err error
+				if s.Length, s.Offset, err = parseByteRange(r, 0); err != nil {
+					return nil, err
+				}
 			}
 			p.Init = s
 		case strings.HasPrefix(l, "#EXTINF:"):
@@ -315,7 +319,10 @@ func ParseMedia(body, playlistURL string) (*MediaPlaylist, error) {
 			v, _, _ = strings.Cut(v, ",")
 			dur, _ = strconv.ParseFloat(v, 64)
 		case strings.HasPrefix(l, "#EXT-X-BYTERANGE:"):
-			length, off := parseByteRange(strings.TrimPrefix(l, "#EXT-X-BYTERANGE:"), nextOffset)
+			length, off, err := parseByteRange(strings.TrimPrefix(l, "#EXT-X-BYTERANGE:"), nextOffset)
+			if err != nil {
+				return nil, err
+			}
 			br = &[2]int64{off, length}
 		case l == "#EXT-X-ENDLIST":
 			p.EndList = true
@@ -336,14 +343,27 @@ func ParseMedia(body, playlistURL string) (*MediaPlaylist, error) {
 	return p, nil
 }
 
-func parseByteRange(s string, prevEnd int64) (length, offset int64) {
-	l, o, hasOff := strings.Cut(s, "@")
-	length, _ = strconv.ParseInt(l, 10, 64)
+// MaxByteRange — наибольшая допустимая длина диапазона сегмента (1 ГБ).
+const MaxByteRange = 1 << 30
+
+// parseByteRange разбирает "длина[@смещение]". Значения приходят из плейлиста
+// удалённого сервера, поэтому отрицательные, переполняющиеся и чрезмерные
+// диапазоны отвергаются.
+func parseByteRange(s string, prevEnd int64) (length, offset int64, err error) {
+	l, o, hasOff := strings.Cut(strings.TrimSpace(s), "@")
+	if length, err = strconv.ParseInt(l, 10, 64); err != nil || length <= 0 || length > MaxByteRange {
+		return 0, 0, fmt.Errorf("hls: invalid byte range %q", s)
+	}
 	offset = prevEnd
 	if hasOff {
-		offset, _ = strconv.ParseInt(o, 10, 64)
+		if offset, err = strconv.ParseInt(o, 10, 64); err != nil || offset < 0 {
+			return 0, 0, fmt.Errorf("hls: invalid byte range %q", s)
+		}
 	}
-	return length, offset
+	if offset > math.MaxInt64-length {
+		return 0, 0, fmt.Errorf("hls: byte range overflows: %q", s)
+	}
+	return length, offset, nil
 }
 
 func parseHex(s string) ([]byte, error) {

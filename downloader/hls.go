@@ -30,7 +30,7 @@ func NewHLS(o Options) *HLS { return &HLS{opts: o} }
 const (
 	maxPlaylistSize = 16 << 20 // m3u8/mpd
 	maxKeySize      = 1 << 10  // ключ AES-128 (ожидается 16 байт)
-	maxSegmentSize  = 1 << 30  // сегмент без явного диапазона
+	maxSegmentSize  = 1 << 30  // сегмент (с диапазоном или без)
 )
 
 // get загружает ресурс; limit — максимальный размер тела (превышение — ошибка).
@@ -59,6 +59,9 @@ func (h *HLS) get(ctx context.Context, u string, headers map[string]string, off,
 		if err != nil {
 			lastErr = err
 			continue
+		}
+		if limit <= 0 || limit > maxSegmentSize {
+			limit = maxSegmentSize // защита от переполнения limit+1 и обхода потолка
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		resp.Body.Close()
@@ -238,8 +241,9 @@ func (h *HLS) download(ctx context.Context, f *media.Format, headers map[string]
 }
 
 func (h *HLS) fetchSegment(ctx context.Context, s hls.Segment, headers map[string]string, keys *keyCache) ([]byte, error) {
+	// диапазон из плейлиста не может поднять лимит выше общего потолка
 	limit := int64(maxSegmentSize)
-	if s.Length > 0 {
+	if s.Length > 0 && s.Length < limit {
 		limit = s.Length
 	}
 	data, err := h.get(ctx, s.URI, headers, s.Offset, s.Length, limit)
