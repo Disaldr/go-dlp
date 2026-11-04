@@ -167,7 +167,11 @@ func playerRequest(ctx context.Context, env *ex.Env, c *Client, id, visitor stri
 		"Origin":                   baseURL,
 		"User-Agent":               c.UserAgent,
 	}
-	if visitor != "" {
+	// Гостевой режим: без привязки к visitor data YouTube выдаёт
+	// web-форматам гостевой playback-грант (параметр pcm2 в URL), который
+	// отдаёт контент без GVS PO Token. С visitor data web-форматы требуют
+	// PO Token и без него возвращают HTTP 403.
+	if visitor != "" && !c.Guest {
 		headers["X-Goog-Visitor-Id"] = visitor
 	}
 	var pr any

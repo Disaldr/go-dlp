@@ -16,6 +16,9 @@ type Client struct {
 	RequireJS bool
 	// RequirePOT — для HTTPS-форматов нужен PO Token.
 	RequirePOT bool
+	// Guest — не отправлять visitor data: YouTube выдаёт гостевой
+	// playback-грант, снимающий требование PO Token (см. playerRequest).
+	Guest bool
 }
 
 // Clients — известные клиенты. Значения синхронизированы с yt-dlp.
@@ -46,7 +49,7 @@ var Clients = map[string]*Client{
 	"web": {
 		Name: "web", ClientName: "WEB", Version: "2.20260708.00.00", ID: 1,
 		UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36,gzip(gfe)",
-		RequireJS: true, RequirePOT: true,
+		RequireJS: true, RequirePOT: true, Guest: true,
 	},
 }
 
