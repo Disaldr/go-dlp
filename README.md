@@ -146,6 +146,7 @@ fmt.Println(<-events)
 | Bluesky | `bluesky` |
 | X (Twitter) | `twitter` (JS) |
 | TikTok | `tiktok` (JS) |
+| Odysee / LBRY | `odysee` (JS) |
 | Telegram | `telegram:embed` (публичные каналы) |
 | Coub | `coub` |
 | Streamable | `streamable` |
