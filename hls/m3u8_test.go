@@ -1,6 +1,7 @@
 package hls
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Disaldr/go-dlp/media"
@@ -56,5 +57,12 @@ seg8.ts
 	}
 	if p.Segments[1].Key != nil {
 		t.Error("METHOD=NONE must reset key")
+	}
+}
+
+func TestParseMediaRejectsLongIV(t *testing.T) {
+	body := "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\",IV=0x" + strings.Repeat("ab", 17) + "\n#EXTINF:1,\ns.ts\n"
+	if _, err := ParseMedia(body, "https://e.com/p.m3u8"); err == nil {
+		t.Error("IV longer than 16 bytes must be rejected")
 	}
 }

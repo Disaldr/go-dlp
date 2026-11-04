@@ -274,9 +274,10 @@ func (c *Client) normalize(info *media.Info, ie, rawURL string) {
 		}
 		if f.Ext == "" {
 			f.Ext = extractor.URLExt(f.URL)
-			if f.Ext == "" || f.Ext == "m3u8" {
-				f.Ext = "mp4"
-			}
+		}
+		// ext и format_id приходят с сайта и попадают в имена файлов — только безопасные символы
+		if f.Ext = safeExt(f.Ext); f.Ext == "" || f.Ext == "m3u8" {
+			f.Ext = "mp4"
 		}
 		// примерный размер из битрейта, как в yt-dlp
 		if f.Filesize == 0 && f.FilesizeApprox == 0 && info.Duration > 0 {
@@ -517,7 +518,7 @@ func (c *Client) downloadPrepared(ctx context.Context, info *media.Info) error {
 	base := strings.TrimSuffix(info.Filename, filepath.Ext(info.Filename))
 	inputs := make([]postprocess.Input, len(formats))
 	for i, f := range formats {
-		inputs[i] = postprocess.Input{Path: fmt.Sprintf("%s.f%s.%s", base, f.FormatID, f.Ext), Format: f}
+		inputs[i] = postprocess.Input{Path: fmt.Sprintf("%s.f%s.%s", base, safeComponent(f.FormatID), safeExt(f.Ext)), Format: f}
 	}
 	if isLive(info) {
 		// видео и аудио эфира пишутся одновременно, иначе дорожки разойдутся во времени
@@ -603,7 +604,10 @@ func (c *Client) writeSubtitles(ctx context.Context, info *media.Info) error {
 		if ext == "" {
 			ext = "vtt"
 		}
-		path := fmt.Sprintf("%s.%s.%s", base, lang, ext)
+		if ext = safeExt(ext); ext == "" {
+			ext = "vtt"
+		}
+		path := fmt.Sprintf("%s.%s.%s", base, safeComponent(lang), ext)
 		data := []byte(t.Data)
 		if t.URL != "" {
 			r, err := c.env.Fetch(ctx, extractor.Request{URL: t.URL, Headers: info.HTTPHeaders})
@@ -630,6 +634,41 @@ func wantLang(langs []string, lang string) bool {
 		}
 	}
 	return false
+}
+
+// safeComponent оставляет в части имени файла только [A-Za-z0-9._-] (без
+// разделителей пути и ".."), прочие символы заменяет на '_'.
+func safeComponent(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+		case c == '.' && i > 0 && b[i-1] != '.':
+		default:
+			b[i] = '_'
+		}
+	}
+	if len(b) > 64 {
+		b = b[:64]
+	}
+	if len(b) == 0 {
+		return "_"
+	}
+	return string(b)
+}
+
+// safeExt — расширение: только [a-z0-9], до 10 символов ("" если не подходит).
+func safeExt(s string) string {
+	s = strings.ToLower(s)
+	if len(s) == 0 || len(s) > 10 {
+		return ""
+	}
+	for _, c := range s {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return ""
+		}
+	}
+	return s
 }
 
 func exists(path string) bool {

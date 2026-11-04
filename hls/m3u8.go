@@ -359,7 +359,10 @@ func parseHex(s string) ([]byte, error) {
 		}
 		out[i] = byte(b)
 	}
-	// IV должен быть 16 байт — дополняем слева нулями
+	// IV — ровно 16 байт: короткую запись дополняем слева нулями, длинную отвергаем
+	if len(out) > 16 {
+		return nil, fmt.Errorf("IV longer than 16 bytes")
+	}
 	if len(out) < 16 {
 		out = append(make([]byte, 16-len(out)), out...)
 	}

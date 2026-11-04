@@ -26,7 +26,15 @@ type HLS struct{ opts Options }
 // NewHLS создаёт HLS-загрузчик.
 func NewHLS(o Options) *HLS { return &HLS{opts: o} }
 
-func (h *HLS) get(ctx context.Context, u string, headers map[string]string, off, length int64) ([]byte, error) {
+// Ограничения на размер ответов (данные приходят с удалённого сервера).
+const (
+	maxPlaylistSize = 16 << 20 // m3u8/mpd
+	maxKeySize      = 1 << 10  // ключ AES-128 (ожидается 16 байт)
+	maxSegmentSize  = 1 << 30  // сегмент без явного диапазона
+)
+
+// get загружает ресурс; limit — максимальный размер тела (превышение — ошибка).
+func (h *HLS) get(ctx context.Context, u string, headers map[string]string, off, length, limit int64) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= h.opts.retries(); attempt++ {
 		if attempt > 0 {
@@ -52,8 +60,11 @@ func (h *HLS) get(ctx context.Context, u string, headers map[string]string, off,
 			lastErr = err
 			continue
 		}
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		resp.Body.Close()
+		if err == nil && int64(len(body)) > limit {
+			return nil, fmt.Errorf("response too large (> %d bytes): %s", limit, u)
+		}
 		if resp.StatusCode >= 400 {
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, u)
 			if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
@@ -81,7 +92,7 @@ func (k *keyCache) get(ctx context.Context, h *HLS, uri string, headers map[stri
 	if b, ok := k.keys[uri]; ok {
 		return b, nil
 	}
-	b, err := h.get(ctx, uri, headers, 0, 0)
+	b, err := h.get(ctx, uri, headers, 0, 0, maxKeySize)
 	if err != nil {
 		return nil, fmt.Errorf("hls: key: %w", err)
 	}
@@ -97,6 +108,9 @@ func decrypt(key []byte, seg hls.Segment, data []byte) ([]byte, error) {
 	if iv == nil {
 		iv = make([]byte, 16)
 		binary.BigEndian.PutUint64(iv[8:], uint64(seg.Seq))
+	}
+	if len(iv) != aes.BlockSize {
+		return nil, fmt.Errorf("hls: invalid IV length %d", len(iv))
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -121,14 +135,20 @@ func decrypt(key []byte, seg hls.Segment, data []byte) ([]byte, error) {
 // Для live-плейлистов (без EXT-X-ENDLIST) плейлист перечитывается,
 // пока трансляция не закончится или не будет отменён ctx.
 func (h *HLS) Download(ctx context.Context, f *media.Format, headers map[string]string, dst string) error {
-	body, err := h.get(ctx, f.URL, headers, 0, 0)
+	return h.download(ctx, f, headers, dst, 0)
+}
+
+// download: depth > 0 — уже перешли из master-плейлиста в вариант
+// (повторный master не разворачиваем, чтобы не уйти в бесконечную рекурсию).
+func (h *HLS) download(ctx context.Context, f *media.Format, headers map[string]string, dst string, depth int) error {
+	body, err := h.get(ctx, f.URL, headers, 0, 0, maxPlaylistSize)
 	if err != nil {
 		return err
 	}
 	pl, err := hls.ParseMedia(string(body), f.URL)
 	if err != nil {
 		// это может оказаться master-плейлист — берём лучший вариант
-		if hls.IsMaster(string(body)) {
+		if hls.IsMaster(string(body)) && depth == 0 {
 			vs := hls.ParseMaster(string(body), f.URL, "hls")
 			if len(vs) == 0 {
 				return err
@@ -141,7 +161,7 @@ func (h *HLS) Download(ctx context.Context, f *media.Format, headers map[string]
 			}
 			cp := *f
 			cp.URL = best.URL
-			return h.Download(ctx, &cp, headers, dst)
+			return h.download(ctx, &cp, headers, dst, depth+1)
 		}
 		return err
 	}
@@ -199,7 +219,7 @@ func (h *HLS) Download(ctx context.Context, f *media.Format, headers map[string]
 			// отмена live-записи — сохраняем то, что успели скачать
 			break
 		}
-		body, err := h.get(ctx, f.URL, headers, 0, 0)
+		body, err := h.get(ctx, f.URL, headers, 0, 0, maxPlaylistSize)
 		if err != nil {
 			if ctx.Err() != nil {
 				break
@@ -218,7 +238,11 @@ func (h *HLS) Download(ctx context.Context, f *media.Format, headers map[string]
 }
 
 func (h *HLS) fetchSegment(ctx context.Context, s hls.Segment, headers map[string]string, keys *keyCache) ([]byte, error) {
-	data, err := h.get(ctx, s.URI, headers, s.Offset, s.Length)
+	limit := int64(maxSegmentSize)
+	if s.Length > 0 {
+		limit = s.Length
+	}
+	data, err := h.get(ctx, s.URI, headers, s.Offset, s.Length, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -375,7 +399,7 @@ func (fd *Fragments) downloadLive(ctx context.Context, h *HLS, f *media.Format, 
 		if err := sleepCtx(ctx, update); err != nil {
 			return nil
 		}
-		body, err := h.get(ctx, f.ManifestURL, headers, 0, 0)
+		body, err := h.get(ctx, f.ManifestURL, headers, 0, 0, maxPlaylistSize)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
