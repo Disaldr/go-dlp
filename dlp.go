@@ -160,8 +160,21 @@ func New(opts Options) (*Client, error) {
 	for ie, kv := range opts.ExtractorArgs {
 		args[strings.ToLower(ie)] = kv
 	}
-	if opts.Impersonate != "" {
-		if _, err := impersonate.Lookup(opts.Impersonate); err != nil {
+	// Если пользователь берёт cookies из браузера, но не задал имитацию и
+	// User-Agent, по умолчанию имитируем тот же браузер. Защитные cookies
+	// (cf_clearance Cloudflare, datadome и т.п.) привязаны к TLS-отпечатку и
+	// User-Agent браузера, который их выдал; без совпадения сервер их не
+	// примет и снова покажет проверку. Это не обход проверки, а продолжение
+	// уже пройденной пользователем в его же браузере сессии.
+	imp := opts.Impersonate
+	if imp == "" && opts.CookiesFromBrowser != "" && opts.UserAgent == "" {
+		if t := browserImpersonate(opts.CookiesFromBrowser); t != "" {
+			imp = t
+			c.log.Debug("matching TLS/User-Agent to browser for its cookies", "impersonate", imp)
+		}
+	}
+	if imp != "" {
+		if _, err := impersonate.Lookup(imp); err != nil {
 			return nil, err
 		}
 	}
@@ -173,7 +186,7 @@ func New(opts Options) (*Client, error) {
 	c.env = &extractor.Env{
 		HTTP: hc, UserAgent: ua, Logger: c.log, Registry: c.reg,
 		Args: args, NoPlaylist: opts.NoPlaylist, MaxEntries: opts.PlaylistEnd,
-		Impersonate:  opts.Impersonate,
+		Impersonate:  imp,
 		Impersonator: &impersonate.Pool{Jar: hc.Jar, Proxy: proxyFn},
 	}
 	if opts.CookiesFromBrowser != "" {
@@ -722,4 +735,19 @@ func safeExt(s string) string {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// browserImpersonate сопоставляет браузеру из --cookies-from-browser
+// (BROWSER[:PROFILE]) цель имитации. Пусто — если совпадения нет.
+func browserImpersonate(spec string) string {
+	browser, _, _ := strings.Cut(spec, ":")
+	switch strings.ToLower(strings.TrimSpace(browser)) {
+	case "chrome", "chromium", "brave", "edge", "opera", "vivaldi", "whale":
+		return "chrome"
+	case "firefox":
+		return "firefox"
+	case "safari":
+		return "safari"
+	}
+	return ""
 }

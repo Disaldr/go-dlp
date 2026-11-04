@@ -80,3 +80,55 @@ func TestParseMediaRejectsLongIV(t *testing.T) {
 		t.Error("IV longer than 16 bytes must be rejected")
 	}
 }
+
+// Подписанный манифест: query должен переноситься на относительные
+// под-плейлисты, ключи и сегменты того же хоста, но не на чужой хост и не
+// поверх собственного query сегмента.
+func TestSignedQueryPropagation(t *testing.T) {
+	master := "#EXTM3U\n" +
+		`#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360` + "\n" +
+		"360p/index.m3u8\n"
+	manifestURL := "https://cdn.example.com/v/master.m3u8?Policy=AAA&Signature=BBB&Key-Pair-Id=CCC"
+	fs := ParseMaster(master, manifestURL, "hls")
+	if len(fs) != 1 {
+		t.Fatalf("got %d variants", len(fs))
+	}
+	if want := "https://cdn.example.com/v/360p/index.m3u8?Policy=AAA&Signature=BBB&Key-Pair-Id=CCC"; fs[0].URL != want {
+		t.Errorf("variant url\n got %s\nwant %s", fs[0].URL, want)
+	}
+
+	media := "#EXTM3U\n" +
+		"#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n" +
+		"#EXT-X-MAP:URI=\"init.mp4\"\n" +
+		"#EXTINF:4.0,\nseg0.ts\n" +
+		"#EXTINF:4.0,\nhttps://cdn.example.com/v/360p/seg1.ts\n" +
+		"#EXTINF:4.0,\nhttps://cdn.example.com/v/360p/seg2.ts?token=own\n" +
+		"#EXTINF:4.0,\nhttps://other.example.net/seg3.ts\n"
+	mediaURL := "https://cdn.example.com/v/360p/index.m3u8?Policy=AAA&Signature=BBB&Key-Pair-Id=CCC"
+	pl, err := ParseMedia(media, mediaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := "?Policy=AAA&Signature=BBB&Key-Pair-Id=CCC"
+	checks := []struct {
+		name, got, want string
+	}{
+		{"key", pl.Segments[0].Key.URI, "https://cdn.example.com/v/360p/key.bin" + q},
+		{"init", pl.Init.URI, "https://cdn.example.com/v/360p/init.mp4" + q},
+		{"relative seg", pl.Segments[0].URI, "https://cdn.example.com/v/360p/seg0.ts" + q},
+		{"absolute same-host seg", pl.Segments[1].URI, "https://cdn.example.com/v/360p/seg1.ts" + q},
+		{"seg with own query", pl.Segments[2].URI, "https://cdn.example.com/v/360p/seg2.ts?token=own"},
+		{"foreign-host seg", pl.Segments[3].URI, "https://other.example.net/seg3.ts"},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s\n got %s\nwant %s", c.name, c.got, c.want)
+		}
+	}
+
+	// Без query у манифеста — ничего не добавляется.
+	pl2, _ := ParseMedia("#EXTM3U\n#EXTINF:4,\nseg.ts\n", "https://cdn.example.com/v/index.m3u8")
+	if pl2.Segments[0].URI != "https://cdn.example.com/v/seg.ts" {
+		t.Errorf("unsigned manifest leaked query: %s", pl2.Segments[0].URI)
+	}
+}

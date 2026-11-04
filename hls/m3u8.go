@@ -54,7 +54,16 @@ func resolve(base, ref string) string {
 	if err != nil {
 		return ref
 	}
-	return b.ResolveReference(r).String()
+	out := b.ResolveReference(r)
+	// Подписанные манифесты (CloudFront: Policy/Signature/Key-Pair-Id,
+	// Akamai token и т.п.) требуют повторять query манифеста в каждом
+	// под-плейлисте, ключе и сегменте. Переносим query базового URL на
+	// дочерний, если у того своего нет и хост совпадает (чужому хосту
+	// подпись не отдаём).
+	if out.RawQuery == "" && b.RawQuery != "" && out.Host == b.Host {
+		out.RawQuery = b.RawQuery
+	}
+	return out.String()
 }
 
 func lines(body string) []string {
