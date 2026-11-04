@@ -81,12 +81,14 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 	}
 	sts := ex.Int(ytcfg, "STS")
 	jsURL := playerURL(ytcfg, page)
-	env.Debug("youtube: webpage config", "id", id, "visitor_data", visitor != "", "sts", sts, "player", jsURL != "")
+	au := sessionAuth(env, ytcfg)
+	env.Debug("youtube: webpage config", "id", id, "visitor_data", visitor != "", "sts", sts, "player", jsURL != "", "logged_in", au != nil)
 
 	// 2. Player API для выбранных клиентов.
 	clients := env.ArgList(ieKey, "player_client")
+	var fallback []string
 	if len(clients) == 0 {
-		clients = DefaultClients
+		clients, fallback = DefaultClients, FallbackClients
 	}
 	var (
 		responses []any
@@ -94,22 +96,22 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 		formats   []*media.Format
 		seen      = map[string]bool{}
 	)
-	for _, name := range clients {
+	try := func(name string) {
 		c, ok := Clients[name]
 		if !ok {
 			env.Warn("youtube: unknown player client, skipping", "client", name)
-			continue
+			return
 		}
-		pr, err := playerRequest(ctx, env, c, id, visitor, sts)
+		pr, err := playerRequest(ctx, env, c, id, visitor, sts, au)
 		if err != nil {
 			lastErr = err
 			env.Warn("youtube: player request failed", "client", name, "err", err)
-			continue
+			return
 		}
 		if err := playability(id, pr); err != nil {
 			lastErr = err
 			env.Debug("youtube: client not playable", "client", name, "err", err)
-			continue
+			return
 		}
 		responses = append(responses, pr)
 		for _, f := range parseFormats(ctx, env, c, pr, jsURL) {
@@ -119,6 +121,17 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 			}
 			seen[key] = true
 			formats = append(formats, f)
+		}
+	}
+	for _, name := range clients {
+		try(name)
+	}
+	// Запасные клиенты — только если основные не дали форматов (например,
+	// «Sign in to confirm you're not a bot» у visionos).
+	if len(formats) == 0 {
+		for _, name := range fallback {
+			env.Debug("youtube: trying fallback client", "client", name)
+			try(name)
 		}
 	}
 	if len(responses) == 0 {
@@ -148,7 +161,7 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 	return info, nil
 }
 
-func playerRequest(ctx context.Context, env *ex.Env, c *Client, id, visitor string, sts int64) (any, error) {
+func playerRequest(ctx context.Context, env *ex.Env, c *Client, id, visitor string, sts int64, au *auth) (any, error) {
 	pbc := map[string]any{"html5Preference": "HTML5_PREF_WANTS"}
 	if sts > 0 {
 		pbc["signatureTimestamp"] = sts
@@ -171,8 +184,12 @@ func playerRequest(ctx context.Context, env *ex.Env, c *Client, id, visitor stri
 	// web-форматам гостевой playback-грант (параметр pcm2 в URL), который
 	// отдаёт контент без GVS PO Token. С visitor data web-форматы требуют
 	// PO Token и без него возвращают HTTP 403.
-	if visitor != "" && !c.Guest {
+	authed := au != nil && c.SupportsCookies
+	if visitor != "" && (!c.Guest || authed) {
 		headers["X-Goog-Visitor-Id"] = visitor
+	}
+	if authed {
+		au.apply(headers)
 	}
 	var pr any
 	err := env.PostJSON(ctx, baseURL+"/youtubei/v1/player?prettyPrint=false", headers, body, &pr)
