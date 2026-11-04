@@ -144,6 +144,8 @@ fmt.Println(<-events)
 | Dailymotion | `dailymotion` |
 | Reddit | `reddit` (нужен `--cookies` залогиненного аккаунта) |
 | Bluesky | `bluesky` |
+| X (Twitter) | `twitter` (JS) |
+| TikTok | `tiktok` (JS) |
 | Telegram | `telegram:embed` (публичные каналы) |
 | Coub | `coub` |
 | Streamable | `streamable` |
@@ -151,6 +153,9 @@ fmt.Println(<-events)
 | PeerTube | `peertube` (любой инстанс) |
 | 18+ | `xvideos`, `xnxx`, `pornhub`, `redtube`, `youporn`, `xhamster`, `eporner` |
 | Остальное | `generic`: прямые ссылки, m3u8, mpd, `<video>`, og:video, JSON-LD, iframe-встраивания |
+
+Экстракторы с пометкой «JS» написаны на JavaScript и обновляются без нового релиза
+(`--update-extractors`, `Client.Scripts()`), см. [docs/script-extractors.md](docs/script-extractors.md).
 
 ## Структура проекта
 
@@ -161,6 +166,8 @@ fmt.Println(<-events)
 | `extractor` | интерфейс `Extractor`, `Registry`, `Env` (HTTP), хелперы разбора | `extractor/common.py`, `utils` |
 | `extractor/extractortest` | хелперы тестов экстракторов | `_TESTS` |
 | `extractors/*` | экстракторы сайтов; `extractors/all` — набор по умолчанию | `extractor/*.py` |
+| `script` | JS-экстракторы (goja), подписанные пакеты и их обновление на лету | — |
+| `cmd/go-dlp-pack` | сборка и подпись пакета JS-экстракторов | — |
 | `format` | сортировка форматов и язык выбора (`bv*+ba/b`, `[height<=720]`, `/`, `+`, `,`) | `build_format_selector` |
 | `downloader` | HTTP (докачка, Range-чанки), HLS (AES-128, live), DASH-фрагменты (live) | `downloader/` |
 | `hls`, `dash` | парсеры m3u8 и MPD | `_parse_m3u8_formats`, `_parse_mpd_formats` |
@@ -170,6 +177,11 @@ fmt.Println(<-events)
 | `cmd/go-dlp`, `internal/cli` | CLI на cobra | `options.py` |
 
 ## Как добавить свой экстрактор
+
+Новые сайты лучше писать на JavaScript (`script/scripts/*.js`): такие экстракторы
+доходят до пользователей без релиза приложения, см.
+[docs/script-extractors.md](docs/script-extractors.md). На Go стоит писать то, что
+требует тяжёлой логики или производительности (например, расшифровку плеера YouTube).
 
 ### 1. Реализуйте интерфейс
 

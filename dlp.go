@@ -30,6 +30,7 @@ import (
 	"github.com/Disaldr/go-dlp/media"
 	"github.com/Disaldr/go-dlp/outtmpl"
 	"github.com/Disaldr/go-dlp/postprocess"
+	"github.com/Disaldr/go-dlp/script"
 )
 
 // Version — версия библиотеки.
@@ -52,6 +53,12 @@ type Options struct {
 
 	// Registry — реестр экстракторов (по умолчанию встроенные).
 	Registry *extractor.Registry
+	// NoBuiltinScripts — не устанавливать встроенные JS-экстракторы
+	// (пакет script). Обновления из сети ставятся через Client.Scripts().
+	NoBuiltinScripts bool
+	// ExtractorScriptsDir — каталог с *.js (и необязательным VERSION),
+	// загружаемый без подписи поверх встроенных — для разработки скриптов.
+	ExtractorScriptsDir string
 	// ExtractorArgs — аргументы экстракторов: ie -> ключ -> значения.
 	ExtractorArgs map[string]map[string][]string
 
@@ -95,11 +102,12 @@ type Options struct {
 
 // Client — основной объект библиотеки (аналог YoutubeDL).
 type Client struct {
-	opts   Options
-	reg    *extractor.Registry
-	env    *extractor.Env
-	ffmpeg *postprocess.FFmpeg
-	log    *slog.Logger
+	opts    Options
+	reg     *extractor.Registry
+	scripts *script.Manager
+	env     *extractor.Env
+	ffmpeg  *postprocess.FFmpeg
+	log     *slog.Logger
 }
 
 // New создаёт клиента.
@@ -107,6 +115,27 @@ func New(opts Options) (*Client, error) {
 	c := &Client{opts: opts, reg: opts.Registry, log: opts.Logger}
 	if c.reg == nil {
 		c.reg = all.Registry()
+	}
+	c.scripts = script.NewManager(c.reg)
+	if !opts.NoBuiltinScripts {
+		p, err := script.Builtin()
+		if err != nil {
+			return nil, fmt.Errorf("builtin scripts: %w", err)
+		}
+		if _, err := c.scripts.Install(p); err != nil {
+			return nil, err
+		}
+	}
+	if opts.ExtractorScriptsDir != "" {
+		p, err := script.LoadDir(os.DirFS(opts.ExtractorScriptsDir))
+		if err != nil {
+			return nil, fmt.Errorf("extractor scripts: %w", err)
+		}
+		// Локальные скрипты ставятся всегда, даже с меньшей VERSION.
+		p.Version = max(p.Version, c.scripts.Version()+1)
+		if _, err := c.scripts.Install(p); err != nil {
+			return nil, err
+		}
 	}
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
@@ -176,6 +205,13 @@ func New(opts Options) (*Client, error) {
 
 // Registry возвращает реестр экстракторов клиента.
 func (c *Client) Registry() *extractor.Registry { return c.reg }
+
+// Scripts возвращает менеджер JS-экстракторов. Обновление без перевыпуска
+// приложения:
+//
+//	u := &script.Updater{CacheDir: dir}
+//	go u.Run(ctx, client.Scripts(), 6*time.Hour)
+func (c *Client) Scripts() *script.Manager { return c.scripts }
 
 // Env возвращает окружение экстракторов.
 func (c *Client) Env() *extractor.Env { return c.env }

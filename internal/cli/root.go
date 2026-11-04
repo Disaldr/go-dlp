@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -17,6 +18,7 @@ import (
 	"github.com/Disaldr/go-dlp/extractor"
 	"github.com/Disaldr/go-dlp/impersonate"
 	"github.com/Disaldr/go-dlp/media"
+	"github.com/Disaldr/go-dlp/script"
 )
 
 type flags struct {
@@ -39,6 +41,9 @@ type flags struct {
 	cookiesFromBrowser                    string
 	impersonate                           string
 	listImpersonate                       bool
+	updateExtractors                      bool
+	extractorScripts                      string
+	extractorPackURL                      string
 }
 
 // NewRootCommand создаёт корневую команду.
@@ -104,6 +109,9 @@ func NewRootCommand() *cobra.Command {
 	fl.BoolVar(&f.writeSubs, "write-subs", false, "сохранять субтитры")
 	fl.StringSliceVar(&f.subLangs, "sub-langs", nil, "языки субтитров (через запятую, all — все)")
 	fl.BoolVar(&f.listExtractors, "list-extractors", false, "список экстракторов")
+	fl.BoolVar(&f.updateExtractors, "update-extractors", false, "скачать свежий подписанный пакет JS-экстракторов (кеш в каталоге кеша пользователя)")
+	fl.StringVar(&f.extractorScripts, "extractor-scripts", "", "каталог с JS-экстракторами (*.js) для разработки, без подписи")
+	fl.StringVar(&f.extractorPackURL, "extractor-pack-url", "", "URL пакета JS-экстракторов (по умолчанию официальный; подпись — URL+\".sig\")")
 
 	cmd.AddCommand(newExtractorsCommand())
 	return cmd
@@ -210,29 +218,30 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 		progress = newProgressPrinter(stderr)
 	}
 	opts := dlp.Options{
-		Format:             f.format,
-		OutputTemplate:     f.output,
-		OutputDir:          f.paths,
-		RestrictFilenames:  f.restrict,
-		MergeOutputFormat:  f.mergeFormat,
-		Overwrite:          f.forceOverwrites,
-		ExtractorArgs:      eargs,
-		Proxy:              f.proxy,
-		CookiesFile:        f.cookies,
-		CookiesFromBrowser: f.cookiesFromBrowser,
-		Impersonate:        f.impersonate,
-		UserAgent:          f.userAgent,
-		FFmpegLocation:     f.ffmpeg,
-		NoPlaylist:         f.noPlaylist,
-		PlaylistStart:      f.playlistStart,
-		PlaylistEnd:        f.playlistEnd,
-		Retries:            f.retries,
-		Fragments:          f.fragments,
-		ChunkSize:          chunk,
-		RateLimit:          rate,
-		WriteSubtitles:     f.writeSubs,
-		SubtitleLangs:      f.subLangs,
-		Logger:             logger,
+		Format:              f.format,
+		OutputTemplate:      f.output,
+		OutputDir:           f.paths,
+		RestrictFilenames:   f.restrict,
+		MergeOutputFormat:   f.mergeFormat,
+		Overwrite:           f.forceOverwrites,
+		ExtractorArgs:       eargs,
+		Proxy:               f.proxy,
+		CookiesFile:         f.cookies,
+		CookiesFromBrowser:  f.cookiesFromBrowser,
+		ExtractorScriptsDir: f.extractorScripts,
+		Impersonate:         f.impersonate,
+		UserAgent:           f.userAgent,
+		FFmpegLocation:      f.ffmpeg,
+		NoPlaylist:          f.noPlaylist,
+		PlaylistStart:       f.playlistStart,
+		PlaylistEnd:         f.playlistEnd,
+		Retries:             f.retries,
+		Fragments:           f.fragments,
+		ChunkSize:           chunk,
+		RateLimit:           rate,
+		WriteSubtitles:      f.writeSubs,
+		SubtitleLangs:       f.subLangs,
+		Logger:              logger,
 	}
 	if progress != nil {
 		opts.Progress = progress.update
@@ -240,6 +249,23 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 	client, err := dlp.New(opts)
 	if err != nil {
 		return err
+	}
+	// Ранее скачанный пакет поднимается из кеша всегда (без сети);
+	// проверка обновлений — только по --update-extractors.
+	u := &script.Updater{URL: f.extractorPackURL, Logger: opts.Logger, HTTP: client.Env().HTTP}
+	if dir, err := os.UserCacheDir(); err == nil {
+		u.CacheDir = filepath.Join(dir, "go-dlp", "extractors")
+	}
+	if f.extractorScripts == "" {
+		if _, err := u.LoadCache(client.Scripts()); err != nil {
+			fmt.Fprintln(stderr, "WARNING: extractor pack cache:", err)
+		}
+	}
+	if f.updateExtractors {
+		if _, err := u.Check(ctx, client.Scripts()); err != nil {
+			fmt.Fprintln(stderr, "WARNING: extractor update failed:", err)
+		}
+		fmt.Fprintf(stderr, "[go-dlp] extractor pack version %d\n", client.Scripts().Version())
 	}
 
 	failed := 0
