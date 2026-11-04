@@ -1,6 +1,7 @@
 package youtube
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"os"
@@ -26,7 +27,7 @@ a.set("n",Nf(a.get("n")));
 `
 
 func TestNewPlayerDecrypt(t *testing.T) {
-	p, err := newPlayer(miniPlayer)
+	p, err := newPlayer(context.Background(), miniPlayer)
 	if err != nil {
 		t.Fatalf("newPlayer: %v", err)
 	}
@@ -47,7 +48,7 @@ func TestNewPlayerDecrypt(t *testing.T) {
 }
 
 func TestDecipherURL(t *testing.T) {
-	p, err := newPlayer(miniPlayer)
+	p, err := newPlayer(context.Background(), miniPlayer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +75,7 @@ func TestDecipherURL(t *testing.T) {
 }
 
 func TestApplyNTransform(t *testing.T) {
-	p, err := newPlayer(miniPlayer)
+	p, err := newPlayer(context.Background(), miniPlayer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +162,7 @@ func TestRealPlayer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := newPlayer(string(code))
+	p, err := newPlayer(context.Background(), string(code))
 	if err != nil {
 		t.Fatalf("newPlayer on real base.js: %v", err)
 	}
@@ -227,7 +228,7 @@ func TestRealPlayerDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := newPlayer(string(code))
+	p, err := newPlayer(context.Background(), string(code))
 	if err != nil {
 		t.Fatalf("newPlayer: %v", err)
 	}

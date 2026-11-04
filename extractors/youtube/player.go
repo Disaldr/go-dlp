@@ -7,11 +7,13 @@ package youtube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dop251/goja"
 
@@ -37,17 +39,85 @@ type player struct {
 
 	combined bool          // true → используется монолитная схема es6
 	solve    goja.Callable // __gdlp_solve(req) -> {sig, n}
+
+	// dead — вызов JS был прерван по таймауту. Состояние движка после
+	// прерывания не гарантировано, а зациклившийся код зациклится снова,
+	// поэтому дальнейшие вызовы сразу завершаются ошибкой.
+	dead bool
 }
+
+// Ограничения исполнения JS. Переменные (а не константы) — для тестов.
+var (
+	// jsLoadTimeout — исполнение кода плеера при сборке движка (es6-плеер
+	// исполняется целиком; обычно это доли секунды).
+	jsLoadTimeout = 30 * time.Second
+	// jsCallTimeout — один вызов расшифровки подписи или n.
+	jsCallTimeout = 5 * time.Second
+)
+
+// Параметры кеша плееров.
+const (
+	// maxCachedPlayers — сколько версий base.js держать в памяти. Каждая
+	// версия — отдельный движок goja со всем кодом плеера; YouTube регулярно
+	// выкатывает новые, а одновременно в ходу обычно одна-две.
+	maxCachedPlayers = 4
+	// playerErrTTL — сколько помнить неудачную загрузку (сеть, разбор). Это
+	// не даёт скачивать base.js заново на каждое видео, но и не делает сбой
+	// вечным. Отмена контекста вызывающего не кешируется вовсе.
+	playerErrTTL = 5 * time.Minute
+)
 
 var (
 	playerCacheMu sync.Mutex
 	playerCache   = map[string]*cachedPlayer{}
+	playerUseSeq  uint64
+
+	// loadPlayerFn — подменяется в тестах.
+	loadPlayerFn = loadPlayer
 )
 
 type cachedPlayer struct {
-	once sync.Once
-	p    *player
-	err  error
+	done     chan struct{} // закрывается по окончании загрузки
+	p        *player
+	err      error
+	failedAt time.Time
+	// transient — загрузка прервана отменой контекста загружавшего; запись
+	// удалена из кеша, ожидающим следует повторить попытку.
+	transient bool
+	used      uint64 // для вытеснения LRU; под playerCacheMu
+}
+
+func (e *cachedPlayer) loaded() bool {
+	select {
+	case <-e.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// errJSInterrupted — исполнение JS прервано (таймаут или отмена контекста).
+var errJSInterrupted = errors.New("player js interrupted")
+
+// watchdog прерывает исполнение JS в vm по истечении d или по отмене ctx.
+// Возвращаемую функцию нужно вызвать после исполнения: она снимает таймер
+// и, если прерывание сработало, сбрасывает его и возвращает ошибку.
+func watchdog(ctx context.Context, vm *goja.Runtime, d time.Duration) func() error {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	fired := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		vm.Interrupt(errJSInterrupted)
+		close(fired)
+	})
+	return func() error {
+		defer cancel()
+		if stop() {
+			return nil
+		}
+		<-fired
+		vm.ClearInterrupt()
+		return fmt.Errorf("%w: %w", errJSInterrupted, context.Cause(ctx))
+	}
 }
 
 var rePlayerID = regexp.MustCompile(`/player/([0-9a-fA-F]{8,})/`)
@@ -67,20 +137,76 @@ func playerURL(ytcfg any, page string) string {
 }
 
 // getPlayer возвращает (кешированные) преобразования для данного base.js.
-// Плеер общий для всех видео в рамках запуска, поэтому кешируется по URL.
+// Плеер общий для всех видео, поэтому кешируется по URL. Параллельные
+// запросы одного URL ждут единственной загрузки; ожидание прерывается
+// отменой ctx. Ошибки помнятся playerErrTTL, отмена контекста — не помнится.
+// В кеше не больше maxCachedPlayers версий (вытесняются давно не нужные).
 func getPlayer(ctx context.Context, env *ex.Env, jsURL string) (*player, error) {
-	playerCacheMu.Lock()
-	entry, ok := playerCache[jsURL]
-	if !ok {
-		entry = &cachedPlayer{}
-		playerCache[jsURL] = entry
-	}
-	playerCacheMu.Unlock()
+	for {
+		playerCacheMu.Lock()
+		e, ok := playerCache[jsURL]
+		if ok && e.loaded() && e.err != nil && time.Since(e.failedAt) > playerErrTTL {
+			delete(playerCache, jsURL)
+			ok = false
+		}
+		playerUseSeq++
+		if !ok {
+			e = &cachedPlayer{done: make(chan struct{}), used: playerUseSeq}
+			playerCache[jsURL] = e
+			playerCacheMu.Unlock()
+			return loadEntry(ctx, env, jsURL, e)
+		}
+		e.used = playerUseSeq
+		playerCacheMu.Unlock()
 
-	entry.once.Do(func() {
-		entry.p, entry.err = loadPlayer(ctx, env, jsURL)
-	})
-	return entry.p, entry.err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-e.done:
+		}
+		if e.transient {
+			continue // загружавший отменил свой запрос — пробуем сами
+		}
+		return e.p, e.err
+	}
+}
+
+func loadEntry(ctx context.Context, env *ex.Env, jsURL string, e *cachedPlayer) (*player, error) {
+	p, err := loadPlayerFn(ctx, env, jsURL)
+
+	playerCacheMu.Lock()
+	defer playerCacheMu.Unlock()
+	e.p, e.err = p, err
+	if err != nil {
+		e.failedAt = time.Now()
+		if ctx.Err() != nil {
+			e.transient = true
+			if playerCache[jsURL] == e {
+				delete(playerCache, jsURL)
+			}
+		}
+	}
+	close(e.done)
+	evictPlayersLocked()
+	return p, err
+}
+
+// evictPlayersLocked удаляет давно не использованные загруженные записи,
+// пока их больше maxCachedPlayers. Загружающиеся записи не трогаются.
+func evictPlayersLocked() {
+	for len(playerCache) > maxCachedPlayers {
+		var victim string
+		var oldest uint64
+		for k, e := range playerCache {
+			if e.loaded() && (victim == "" || e.used < oldest) {
+				victim, oldest = k, e.used
+			}
+		}
+		if victim == "" {
+			return
+		}
+		delete(playerCache, victim)
+	}
 }
 
 func loadPlayer(ctx context.Context, env *ex.Env, jsURL string) (*player, error) {
@@ -88,29 +214,36 @@ func loadPlayer(ctx context.Context, env *ex.Env, jsURL string) (*player, error)
 	if err != nil {
 		return nil, fmt.Errorf("download player %s: %w", jsURL, err)
 	}
-	return newPlayer(code)
+	return newPlayer(ctx, code)
 }
 
 // newPlayer собирает движок goja с функциями расшифровки из исходника base.js.
 // Сначала пробуется монолитная схема es6 (по маркеру функции-подписывателя);
-// при её отсутствии — классическая схема с отдельными функциями.
-func newPlayer(code string) (*player, error) {
+// при её отсутствии — классическая схема с отдельными функциями. Исполнение
+// JS ограничено jsLoadTimeout и прерывается отменой ctx.
+func newPlayer(ctx context.Context, code string) (*player, error) {
 	if name := findSignerName(code); name != "" {
-		if p, err := newES6Player(code, name); err == nil {
+		if p, err := newES6Player(ctx, code, name); err == nil {
 			return p, nil
 		} else {
 			return nil, err
 		}
 	}
-	return newClassicPlayer(code)
+	return newClassicPlayer(ctx, code)
 }
 
-func newClassicPlayer(code string) (*player, error) {
+func newClassicPlayer(ctx context.Context, code string) (p *player, err error) {
 	sigSrc, err := extractSigFunction(code)
 	if err != nil {
 		return nil, err
 	}
 	vm := goja.New()
+	release := watchdog(ctx, vm, jsLoadTimeout)
+	defer func() {
+		if werr := release(); werr != nil {
+			p, err = nil, werr
+		}
+	}()
 	if _, err := vm.RunString(sigSrc + "\nvar __godlp_sig=" + sigEntryName + ";"); err != nil {
 		return nil, fmt.Errorf("compile signature function: %w", err)
 	}
@@ -118,7 +251,7 @@ func newClassicPlayer(code string) (*player, error) {
 	if !ok {
 		return nil, fmt.Errorf("signature function is not callable")
 	}
-	p := &player{vm: vm, decipher: decipher}
+	p = &player{vm: vm, decipher: decipher}
 
 	// n-функция необязательна: без неё загрузка работает, но YouTube может
 	// резать скорость. Поэтому её отсутствие не делает плеер непригодным.
@@ -181,12 +314,18 @@ function __gdlp_solve(req) {
 `
 
 // newES6Player разворачивает плеер и готовит обёртку-solver в goja.
-func newES6Player(code, signer string) (*player, error) {
+func newES6Player(ctx context.Context, code, signer string) (p *player, err error) {
 	body, err := unwrapPlayerBody(code)
 	if err != nil {
 		return nil, err
 	}
 	vm := goja.New()
+	release := watchdog(ctx, vm, jsLoadTimeout)
+	defer func() {
+		if werr := release(); werr != nil {
+			p, err = nil, werr
+		}
+	}()
 	if _, err := vm.RunString(envStub); err != nil {
 		return nil, fmt.Errorf("es6 env stub: %w", err)
 	}
@@ -207,7 +346,7 @@ func newES6Player(code, signer string) (*player, error) {
 	if !ok {
 		return nil, fmt.Errorf("es6 solver is not callable")
 	}
-	p := &player{vm: vm, combined: true, solve: solve, hasN: true}
+	p = &player{vm: vm, combined: true, solve: solve, hasN: true}
 	// Контроль работоспособности: подпись должна преобразовываться.
 	probe := "0123456789ABCDEFGHIJ0123456789ABCDEFGHIJ0123456789ABCDEFGHIJ0123456789ABCDEFGHIJ"
 	out, err := p.solveField("sig", probe)
@@ -297,45 +436,55 @@ func unwrapPlayerBody(code string) (string, error) {
 	return body, nil
 }
 
-// decryptSig расшифровывает подпись s.
-func (p *player) decryptSig(s string) (string, error) {
+// call исполняет fn над движком под мьютексом с таймаутом jsCallTimeout.
+// После прерывания плеер помечается мёртвым.
+func (p *player) call(fn func() (string, error)) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.combined {
-		v, err := p.solveField("sig", s)
+	if p.dead {
+		return "", fmt.Errorf("%w earlier; player disabled", errJSInterrupted)
+	}
+	release := watchdog(context.Background(), p.vm, jsCallTimeout)
+	out, err := fn()
+	if werr := release(); werr != nil {
+		p.dead = true
+		return "", werr
+	}
+	return out, err
+}
+
+// decryptSig расшифровывает подпись s.
+func (p *player) decryptSig(s string) (string, error) {
+	return p.call(func() (string, error) {
+		if p.combined {
+			return p.solveField("sig", s)
+		}
+		v, err := p.decipher(goja.Undefined(), p.vm.ToValue(s))
 		if err != nil {
 			return "", err
 		}
-		return v, nil
-	}
-	v, err := p.decipher(goja.Undefined(), p.vm.ToValue(s))
-	if err != nil {
-		return "", err
-	}
-	return v.String(), nil
+		return v.String(), nil
+	})
 }
 
 // decryptN преобразует throttling-параметр n (если функция найдена).
 func (p *player) decryptN(n string) (string, bool) {
-	if p.combined {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		out, err := p.solveField("n", n)
-		if err != nil || out == "" || out == n || strings.HasPrefix(out, "enhanced_except") {
-			return "", false
-		}
-		return out, true
-	}
-	if !p.hasN {
+	if !p.combined && !p.hasN {
 		return "", false
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	v, err := p.transformN(goja.Undefined(), p.vm.ToValue(n))
+	out, err := p.call(func() (string, error) {
+		if p.combined {
+			return p.solveField("n", n)
+		}
+		v, err := p.transformN(goja.Undefined(), p.vm.ToValue(n))
+		if err != nil {
+			return "", err
+		}
+		return v.String(), nil
+	})
 	if err != nil {
 		return "", false
 	}
-	out := v.String()
 	// Признак провала: функция вернула исходное значение или начало с "enhanced_except".
 	if out == "" || out == n || strings.HasPrefix(out, "enhanced_except") {
 		return "", false
