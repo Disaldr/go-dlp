@@ -1,6 +1,8 @@
 package youtube
 
 import (
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -145,6 +147,11 @@ func stubEnv() *ex.Env { return &ex.Env{} }
 
 // TestRealPlayer проверяет извлечение на настоящем base.js.
 // Включается указанием пути: GODLP_BASEJS=/path/to/base.js go test ./extractors/youtube.
+//
+// Для точной проверки можно задать ожидаемые значения (эталон — yt-dlp или
+// ejs-solver): GODLP_SIG_IN/GODLP_SIG_OUT и GODLP_N_IN/GODLP_N_OUT. При их
+// наличии результат сверяется побайтово; иначе проверяется лишь то, что
+// преобразование вообще произошло.
 func TestRealPlayer(t *testing.T) {
 	path := os.Getenv("GODLP_BASEJS")
 	if path == "" {
@@ -158,24 +165,90 @@ func TestRealPlayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newPlayer on real base.js: %v", err)
 	}
-	// Подпись — 80+ символов из [A-Za-z0-9_-]; результат должен быть такой же
-	// длины и отличаться от входа (хотя бы перестановка/усечение).
-	sig := "AAJfQdSswRgIhAIxfakefakefakefakefakefakefakefakefakefakefakefake0123456789AAAAAAAA"
-	out, err := p.decryptSig(sig)
+	t.Logf("combined(es6)=%v hasN=%v", p.combined, p.hasN)
+
+	// --- подпись ---
+	sigIn := os.Getenv("GODLP_SIG_IN")
+	if sigIn == "" {
+		sigIn = "AAJfQdSswRgIhAIxfakefakefakefakefakefakefakefakefakefakefakefake0123456789AAAAAAAA"
+	}
+	out, err := p.decryptSig(sigIn)
 	if err != nil {
 		t.Fatalf("decryptSig: %v", err)
 	}
-	if out == "" || out == sig {
+	if out == "" || out == sigIn {
 		t.Errorf("decryptSig produced no transform: %q", out)
 	}
-	t.Logf("sig %d -> %d chars; n-transform available: %v", len(sig), len(out), p.hasN)
-	if p.hasN {
-		if n, ok := p.decryptN("5hhEOA2Dj3aB8xZq"); ok {
-			t.Logf("decryptN(5hhEOA2Dj3aB8xZq) = %q", n)
-		} else {
-			t.Error("decryptN failed on real player")
-		}
+	if want := os.Getenv("GODLP_SIG_OUT"); want != "" && out != want {
+		t.Errorf("decryptSig(%q) = %q, want %q", sigIn, out, want)
 	} else {
-		t.Error("n-transform function not found in real player")
+		t.Logf("decryptSig(%q) = %q", sigIn, out)
+	}
+
+	// --- n-параметр ---
+	if !p.hasN {
+		t.Fatal("n-transform not available on real player")
+	}
+	nIn := os.Getenv("GODLP_N_IN")
+	if nIn == "" {
+		nIn = "5hhEOA2Dj3aB8xZq"
+	}
+	n, ok := p.decryptN(nIn)
+	if !ok {
+		t.Fatal("decryptN failed on real player")
+	}
+	if want := os.Getenv("GODLP_N_OUT"); want != "" && n != want {
+		t.Errorf("decryptN(%q) = %q, want %q", nIn, n, want)
+	} else {
+		t.Logf("decryptN(%q) = %q", nIn, n)
+	}
+}
+
+// TestRealPlayerDownload — функциональная проверка: расшифровка реальной
+// signatureCipher настоящим плеером и диапазонный GET первых байт (ожидается
+// 200/206; неверные sig/n дают 403). Включается заданием пути к base.js и
+// самой signatureCipher (сырое значение из streamingData, клиент web/tv):
+//
+//	GODLP_BASEJS=/path/base.js GODLP_CIPHER='s=...&sp=sig&url=...' go test -run TestRealPlayerDownload
+func TestRealPlayerDownload(t *testing.T) {
+	path := os.Getenv("GODLP_BASEJS")
+	cipher := os.Getenv("GODLP_CIPHER")
+	if cf := os.Getenv("GODLP_CIPHER_FILE"); cipher == "" && cf != "" {
+		b, err := os.ReadFile(cf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cipher = strings.TrimSpace(string(b))
+	}
+	if path == "" || cipher == "" {
+		t.Skip("set GODLP_BASEJS and GODLP_CIPHER (or GODLP_CIPHER_FILE) to run")
+	}
+	code, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := newPlayer(string(code))
+	if err != nil {
+		t.Fatalf("newPlayer: %v", err)
+	}
+	u, err := decipherURL(p, cipher)
+	if err != nil {
+		t.Fatalf("decipherURL: %v", err)
+	}
+	u = applyNTransform(stubEnv(), p, u)
+	t.Logf("deciphered URL: %.120s...", u)
+
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("Range", "bytes=0-1023")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	n, _ := io.Copy(io.Discard, resp.Body)
+	t.Logf("HTTP %d, %d bytes", resp.StatusCode, n)
+	if resp.StatusCode != 200 && resp.StatusCode != 206 {
+		t.Fatalf("expected 200/206, got %d (sig/n likely wrong)", resp.StatusCode)
 	}
 }

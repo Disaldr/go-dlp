@@ -21,12 +21,22 @@ import (
 // player — извлечённые из base.js преобразования, привязанные к одному
 // движку goja. Движок goja не потокобезопасен, поэтому доступ к нему
 // сериализуется мьютексом; за время экстракции вызовов немного.
+//
+// Поддерживаются две схемы плеера:
+//   - классическая: отдельные функции дешифровки подписи и n-параметра
+//     (поля decipher/transformN);
+//   - монолитная (player_es6, актуальная): единая функция-«подписыватель»
+//     URL, через которую проходят и s, и n; для неё в goja исполняется весь
+//     код плеера и вызывается обёртка-solver (поле solve, combined=true).
 type player struct {
 	mu         sync.Mutex
 	vm         *goja.Runtime
 	decipher   goja.Callable
 	transformN goja.Callable
 	hasN       bool
+
+	combined bool          // true → используется монолитная схема es6
+	solve    goja.Callable // __gdlp_solve(req) -> {sig, n}
 }
 
 var (
@@ -82,7 +92,20 @@ func loadPlayer(ctx context.Context, env *ex.Env, jsURL string) (*player, error)
 }
 
 // newPlayer собирает движок goja с функциями расшифровки из исходника base.js.
+// Сначала пробуется монолитная схема es6 (по маркеру функции-подписывателя);
+// при её отсутствии — классическая схема с отдельными функциями.
 func newPlayer(code string) (*player, error) {
+	if name := findSignerName(code); name != "" {
+		if p, err := newES6Player(code, name); err == nil {
+			return p, nil
+		} else {
+			return nil, err
+		}
+	}
+	return newClassicPlayer(code)
+}
+
+func newClassicPlayer(code string) (*player, error) {
 	sigSrc, err := extractSigFunction(code)
 	if err != nil {
 		return nil, err
@@ -111,10 +134,180 @@ func newPlayer(code string) (*player, error) {
 
 const sigEntryName = "__godlp_sig_fn"
 
+// --- монолитная схема es6 ---
+//
+// Актуальный player_es6 не содержит классических функций: s и n проходят
+// через единую функцию-«подписыватель» URL (строит объект-URL, применяет
+// преобразования при чтении/вызове метода). yt-dlp (ejs-solver) находит эту
+// функцию по маркеру — телу с инструкцией вида `obj.method("alr","yes")` —
+// и исполняет весь код плеера в JS-движке. Здесь то же делается в goja:
+// разворачивается IIFE плеера, весь код исполняется в глобальной области, а
+// затем вызывается обёртка-solver, повторяющая createSolver из ejs.
+
+// envStub — минимальное окружение браузера, которого достаточно плееру для
+// исполнения вне DOM (повторяет setup из ejs-solver). Также заводит глобаль
+// g — объект, который в оригинале передаётся в IIFE как параметр.
+const envStub = `
+if (typeof globalThis.XMLHttpRequest === "undefined") { globalThis.XMLHttpRequest = { prototype: {} }; }
+globalThis.location = { hash:"", host:"www.youtube.com", hostname:"www.youtube.com", href:"https://www.youtube.com/watch?v=yt-dlp-wins", origin:"https://www.youtube.com", password:"", pathname:"/watch", port:"", protocol:"https:", search:"?v=yt-dlp-wins", username:"" };
+if (typeof globalThis.document === "undefined") { globalThis.document = Object.create(null); }
+if (typeof globalThis.navigator === "undefined") { globalThis.navigator = Object.create(null); }
+if (typeof globalThis.self === "undefined") { globalThis.self = globalThis; }
+if (typeof globalThis.window === "undefined") { globalThis.window = globalThis; }
+var g = {};
+var _yt_player = g;
+`
+
+// solverTmpl — обёртка над функцией-подписывателем (%s — её имя). Повторяет
+// логику createSolver из ejs: строит URL, прогоняет через него s и n и
+// считывает результаты. Вызов первого «непривилегированного» метода прототипа
+// URL триггерит преобразование n.
+const solverTmpl = `
+function __gdlp_solve(req) {
+  var fn = %s;
+  var sig = req.sig, n = req.n;
+  var url = fn("https://youtube.com/watch?v=yt-dlp-wins", "s", sig ? encodeURIComponent(sig) : undefined);
+  url.set("n", n);
+  var proto = Object.getPrototypeOf(url);
+  var keys = Object.keys(proto).concat(Object.getOwnPropertyNames(proto));
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    if (["constructor","set","get","clone"].indexOf(key) === -1) { url[key](); break; }
+  }
+  var s = url.get("s");
+  var nn = url.get("n");
+  return { sig: s == null ? null : decodeURIComponent(s), n: nn == null ? null : nn };
+}
+`
+
+// newES6Player разворачивает плеер и готовит обёртку-solver в goja.
+func newES6Player(code, signer string) (*player, error) {
+	body, err := unwrapPlayerBody(code)
+	if err != nil {
+		return nil, err
+	}
+	vm := goja.New()
+	if _, err := vm.RunString(envStub); err != nil {
+		return nil, fmt.Errorf("es6 env stub: %w", err)
+	}
+	// Весь код плеера исполняется в глобальной области: объявления var и
+	// function становятся глобальными, как в оригинальном замыкании. Ошибки
+	// побочных эффектов не фатальны, если функция-подписыватель всё же задана.
+	_, runErr := vm.RunString(body)
+	if fn := vm.Get(signer); fn == nil || goja.IsUndefined(fn) || goja.IsNull(fn) {
+		if runErr != nil {
+			return nil, fmt.Errorf("run es6 player: %w", runErr)
+		}
+		return nil, fmt.Errorf("es6 signer %q is undefined after run", signer)
+	}
+	if _, err := vm.RunString(fmt.Sprintf(solverTmpl, signer)); err != nil {
+		return nil, fmt.Errorf("es6 solver: %w", err)
+	}
+	solve, ok := goja.AssertFunction(vm.Get("__gdlp_solve"))
+	if !ok {
+		return nil, fmt.Errorf("es6 solver is not callable")
+	}
+	p := &player{vm: vm, combined: true, solve: solve, hasN: true}
+	// Контроль работоспособности: подпись должна преобразовываться.
+	probe := "0123456789ABCDEFGHIJ0123456789ABCDEFGHIJ0123456789ABCDEFGHIJ0123456789ABCDEFGHIJ"
+	out, err := p.solveField("sig", probe)
+	if err != nil || out == "" {
+		return nil, fmt.Errorf("es6 signer %q failed probe: %v", signer, err)
+	}
+	return p, nil
+}
+
+// solveField вызывает solver и возвращает поле sig или n. Вызывающий держит mu
+// (кроме newES6Player, где движок ещё не опубликован).
+func (p *player) solveField(field, in string) (string, error) {
+	r, err := p.solve(goja.Undefined(), p.vm.ToValue(map[string]any{field: in}))
+	if err != nil {
+		return "", err
+	}
+	v := r.ToObject(p.vm).Get(field)
+	if v == nil || goja.IsNull(v) || goja.IsUndefined(v) {
+		return "", fmt.Errorf("solver returned null %s", field)
+	}
+	return v.String(), nil
+}
+
+// reSignerMarker — маркер функции-подписывателя: инструкция-выражение вида
+// `obj.method("alr","yes")` (obj — простой идентификатор), стоящая отдельным
+// оператором. Это фингерпринт из ejs-solver (структура asdasd).
+var reSignerMarker = regexp.MustCompile(`[;{]\s*[A-Za-z0-9_$]+\.[A-Za-z0-9_$]+\("alr","yes"\)`)
+
+// reSignerHeader — заголовки функций в одной из форм: `function N(`,
+// `N=function(`, `var N=function(`.
+var reSignerHeader = regexp.MustCompile(`(?:function\s+([A-Za-z0-9_$]+)|(?:var\s+)?([A-Za-z0-9_$]+)\s*=\s*function)\s*\(`)
+
+// findSignerName возвращает имя функции-подписывателя URL в es6-плеере или ""
+// (тогда используется классическая схема). Ищется первая функция указанных
+// форм, в теле которой присутствует маркер; синхронные (не async) функции.
+func findSignerName(code string) string {
+	for _, loc := range reSignerHeader.FindAllStringSubmatchIndex(code, -1) {
+		name := ""
+		if loc[2] >= 0 {
+			name = code[loc[2]:loc[3]]
+		} else if loc[4] >= 0 {
+			name = code[loc[4]:loc[5]]
+		}
+		if name == "" {
+			continue
+		}
+		if strings.HasSuffix(code[:loc[0]], "async ") {
+			continue
+		}
+		open := strings.IndexByte(code[loc[1]-1:], '{')
+		if open < 0 {
+			continue
+		}
+		open += loc[1] - 1
+		end, ok := matchBrace(code, open)
+		if !ok {
+			continue
+		}
+		if reSignerMarker.MatchString(code[open : end+1]) {
+			return name
+		}
+	}
+	return ""
+}
+
+// unwrapPlayerBody извлекает тело IIFE плеера:
+// `var _yt_player={};(function(g){var window=this;<BODY>})(_yt_player);`.
+// IIFE — последний оператор файла, поэтому его закрытие надёжно находится по
+// последнему `})(`. Сканировать баланс скобок по всему плееру нельзя: в коде
+// есть regex-литералы с несбалансированными `{`/`}`.
+func unwrapPlayerBody(code string) (string, error) {
+	i := strings.Index(code, "(function(")
+	if i < 0 {
+		return "", fmt.Errorf("player IIFE not found")
+	}
+	open := strings.IndexByte(code[i:], '{')
+	if open < 0 {
+		return "", fmt.Errorf("player IIFE body not found")
+	}
+	open += i
+	end := strings.LastIndex(code, "})(")
+	if end <= open {
+		return "", fmt.Errorf("player IIFE close not found")
+	}
+	body := strings.TrimSpace(code[open+1 : end])
+	body = strings.TrimPrefix(body, "var window=this;")
+	return body, nil
+}
+
 // decryptSig расшифровывает подпись s.
 func (p *player) decryptSig(s string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.combined {
+		v, err := p.solveField("sig", s)
+		if err != nil {
+			return "", err
+		}
+		return v, nil
+	}
 	v, err := p.decipher(goja.Undefined(), p.vm.ToValue(s))
 	if err != nil {
 		return "", err
@@ -124,6 +317,15 @@ func (p *player) decryptSig(s string) (string, error) {
 
 // decryptN преобразует throttling-параметр n (если функция найдена).
 func (p *player) decryptN(n string) (string, bool) {
+	if p.combined {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		out, err := p.solveField("n", n)
+		if err != nil || out == "" || out == n || strings.HasPrefix(out, "enhanced_except") {
+			return "", false
+		}
+		return out, true
+	}
 	if !p.hasN {
 		return "", false
 	}

@@ -313,9 +313,11 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
 ## Ограничения
 
 - YouTube: по умолчанию клиент без JS-плеера (`visionos`) с готовыми URL. Расшифровка подписи и
-  n-параметра через JS (goja) реализована для «классических» плееров и включается опционально
-  (`--extractor-args youtube:player_client=tv`), но новейшие es6-плееры YouTube и PO Token пока не
-  поддерживаются.
+  n-параметра через JS (goja) реализована и для «классических», и для новейших es6-плееров
+  (весь код плеера исполняется в goja, функция-подписыватель URL находится структурно). Клиенты
+  с шифрованными форматами включаются через `--extractor-args youtube:player_client=tv` (или `web`).
+  PO Token пока не поддерживается: для многих видео web/tv-форматы без него отдают HTTP 403,
+  поэтому `tv`/`web` не включены по умолчанию.
 - DASH: в статических манифестах берётся первый Period, живые — только SegmentTemplate; DRM не поддерживается.
 - Логин по паролю не поддерживается — используйте `--cookies` (Netscape `cookies.txt` или JSON-экспорт
   Cookie-Editor/EditThisCookie) либо `--cookies-from-browser BROWSER[:PROFILE]` (Firefox, Chromium-браузеры
