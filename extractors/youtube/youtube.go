@@ -65,13 +65,14 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 	watchURL := baseURL + "/watch?v=" + id
 
 	// 1. Веб-страница: visitorData и initial player response (метаданные).
-	var initialPR, ytcfg any
+	var initialPR, ytcfg, initialData any
 	page, err := env.GetText(ctx, watchURL+"&bpctr=9999999999&has_verified=1", consentHeaders)
 	if err != nil {
 		env.Warn("youtube: unable to download webpage", "id", id, "err", err)
 	} else {
 		ytcfg, _ = ex.JSONAfter(page, "ytcfg.set(")
 		initialPR, _ = ex.JSONAfter(page, "var ytInitialPlayerResponse = ", "ytInitialPlayerResponse = ")
+		initialData, _ = ex.JSONAfter(page, "var ytInitialData = ", `window["ytInitialData"] = `)
 	}
 	visitor := ex.FirstStr(ytcfg, ex.P("VISITOR_DATA"), ex.P("INNERTUBE_CONTEXT", "client", "visitorData"))
 	if visitor == "" {
@@ -141,6 +142,7 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 		return nil, ex.Errorf(ieKey, id, ex.ErrNoFormats, "no formats found (all formats may require JS player or PO Token)")
 	}
 	info.Subtitles, info.AutomaticCaptions = captions(responses[0], meta)
+	info.Chapters = chapters(initialData, info.Description, info.Duration)
 	return info, nil
 }
 
@@ -424,4 +426,42 @@ func captions(prs ...any) (subs, auto map[string][]media.Subtitle) {
 		auto = nil
 	}
 	return subs, auto
+}
+
+// chapters: маркеры плеера → панель «Главы» → таймкоды в описании (как в yt-dlp).
+func chapters(data any, description string, duration float64) []media.Chapter {
+	text := func(v any, k string) string {
+		return ex.FirstStr(v, ex.P(k, "simpleText"), ex.P(k, "runs", 0, "text"))
+	}
+	var raw []ex.RawChapter
+	for _, c := range ex.Slice(data, "playerOverlays", "playerOverlayRenderer", "decoratedPlayerBarRenderer",
+		"decoratedPlayerBarRenderer", "playerBar", "chapteredPlayerBarRenderer", "chapters") {
+		r := ex.Map(c, "chapterRenderer")
+		start := -1.0
+		if v := ex.Get(r, "timeRangeStartMillis"); v != nil {
+			start = ex.ToFloat(v) / 1000
+		}
+		raw = append(raw, ex.RawChapter{Start: start, Title: text(r, "title")})
+	}
+	if ch := ex.BuildChapters(raw, duration, false); len(ch) > 0 {
+		return ch
+	}
+	for _, p := range ex.Slice(data, "engagementPanels") {
+		raw = raw[:0]
+		for _, it := range ex.Slice(p, "engagementPanelSectionListRenderer", "content", "macroMarkersListRenderer", "contents") {
+			r := ex.Map(it, "macroMarkersListItemRenderer")
+			if r == nil {
+				continue
+			}
+			start := -1.0
+			if t := text(r, "timeDescription"); t != "" {
+				start = ex.ParseDuration(t)
+			}
+			raw = append(raw, ex.RawChapter{Start: start, Title: text(r, "title")})
+		}
+		if ch := ex.BuildChapters(raw, duration, false); len(ch) > 0 {
+			return ch
+		}
+	}
+	return ex.ChaptersFromDescription(description, duration)
 }

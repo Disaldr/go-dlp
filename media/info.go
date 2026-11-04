@@ -57,6 +57,7 @@ type Info struct {
 	Thumbnail  string      `json:"thumbnail,omitempty"`
 	Thumbnails []Thumbnail `json:"thumbnails,omitempty"`
 
+	Chapters          []Chapter             `json:"chapters,omitempty"`
 	Formats           []*Format             `json:"formats,omitempty"`
 	Subtitles         map[string][]Subtitle `json:"subtitles,omitempty"`
 	AutomaticCaptions map[string][]Subtitle `json:"automatic_captions,omitempty"`
@@ -78,6 +79,13 @@ type Info struct {
 	Ext              string    `json:"ext,omitempty"`
 	RequestedFormats []*Format `json:"requested_formats,omitempty"`
 	Filename         string    `json:"filename,omitempty"`
+}
+
+// Chapter — глава видео (секунды от начала).
+type Chapter struct {
+	StartTime float64 `json:"start_time"`
+	EndTime   float64 `json:"end_time"`
+	Title     string  `json:"title,omitempty"`
 }
 
 // Thumbnail — превью.
