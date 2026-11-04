@@ -26,6 +26,17 @@ var (
 	// (kWidget.embed({wid:"_123", entry_id:"0_abc"}) или /p/{pid}/... entry_id/{entry}).
 	reKalturaEntry   = regexp.MustCompile(`["'/]entry_?[iI]d["'\s:=/]+([01]_[0-9a-zA-Z]{8})`)
 	reKalturaPartner = regexp.MustCompile(`(?:partner_id["'\s:=]+|["']?wid["']?\s*:\s*["']_|/p/)(\d+)`)
+
+	// Vimeo (inline, не iframe): data-vimeo-id + необязательный data-vimeo-hash,
+	// либо явный player.vimeo.com/video/{id} в скрипте. Голые ссылки vimeo.com/{id}
+	// не трогаем — это может быть просто ссылка, а не встраивание.
+	reVimeoData   = regexp.MustCompile(`data-vimeo-id\s*=\s*["']?(\d+)`)
+	reVimeoHash   = regexp.MustCompile(`data-vimeo-hash\s*=\s*["']?([\da-f]+)`)
+	reVimeoPlayer = regexp.MustCompile(`player\.vimeo\.com/video/(\d+)(?:\?(?:[^"'\s]*&)?h=([\da-f]+))?`)
+
+	// Dailymotion (inline): data-dailymotion-id или geo.dailymotion.com/player?video={id}.
+	reDMData   = regexp.MustCompile(`data-dailymotion-id\s*=\s*["']?(x[0-9a-z]+)`)
+	reDMPlayer = regexp.MustCompile(`geo\.dailymotion\.com/player[^"'\s]*[?&]video=(x[0-9a-z]+)`)
 )
 
 // detectInlineEmbeds возвращает канонические URL/схемы встроенных плееров,
@@ -59,6 +70,26 @@ func detectInlineEmbeds(page string) []string {
 		if pid := reKalturaPartner.FindStringSubmatch(page); pid != nil {
 			add("kaltura:" + pid[1] + ":" + entry[1])
 		}
+	}
+	if v := reVimeoData.FindStringSubmatch(page); v != nil {
+		u := "https://player.vimeo.com/video/" + v[1]
+		if h := reVimeoHash.FindStringSubmatch(page); h != nil {
+			u += "?h=" + h[1]
+		}
+		add(u)
+	}
+	for _, m := range reVimeoPlayer.FindAllStringSubmatch(page, -1) {
+		u := "https://player.vimeo.com/video/" + m[1]
+		if m[2] != "" {
+			u += "?h=" + m[2]
+		}
+		add(u)
+	}
+	for _, m := range reDMData.FindAllStringSubmatch(page, -1) {
+		add("https://www.dailymotion.com/video/" + m[1])
+	}
+	for _, m := range reDMPlayer.FindAllStringSubmatch(page, -1) {
+		add("https://www.dailymotion.com/video/" + m[1])
 	}
 	return out
 }
