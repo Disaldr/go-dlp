@@ -136,6 +136,7 @@ fmt.Println(<-events)
 | Twitch | `twitch:vod`, `twitch:clips`, `twitch:stream`, `twitch:videos` |
 | Kick | `kick:live`, `kick:vod`, `kick:clip`, `kick:videos` |
 | VK | `vk` (видео, клипы, embed), `vk:uservideos` (видео сообщества/пользователя, плейлисты) |
+| Mail.ru | `mailru` (JS) |
 | Одноклассники | `odnoklassniki` |
 | Rutube | `rutube`, `rutube:playlist` |
 | SoundCloud | `soundcloud`, `soundcloud:set`, `soundcloud:user` |
