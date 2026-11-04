@@ -50,8 +50,12 @@ var Clients = map[string]*Client{
 	},
 }
 
-// DefaultClients — клиенты по умолчанию (без JS-рантайма, как
-// _DEFAULT_JSLESS_CLIENTS в yt-dlp).
+// DefaultClients — клиенты по умолчанию. visionos отдаёт готовые URL без
+// расшифровки подписи. Клиент tv даёт полный набор форматов, но его подписи
+// требуют JS-плеера: на «классических» плеерах go-dlp их расшифровывает
+// (goja), однако новейшие es6-плееры YouTube пока не поддерживаются, поэтому
+// tv не включён по умолчанию — включается через
+// --extractor-args youtube:player_client=tv.
 var DefaultClients = []string{"visionos"}
 
 func (c *Client) context() map[string]any {

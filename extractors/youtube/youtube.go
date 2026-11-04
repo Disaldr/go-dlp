@@ -4,6 +4,7 @@ package youtube
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -79,7 +80,8 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 		visitor = ex.Str(initialPR, "responseContext", "visitorData")
 	}
 	sts := ex.Int(ytcfg, "STS")
-	env.Debug("youtube: webpage config", "id", id, "visitor_data", visitor != "", "sts", sts)
+	jsURL := playerURL(ytcfg, page)
+	env.Debug("youtube: webpage config", "id", id, "visitor_data", visitor != "", "sts", sts, "player", jsURL != "")
 
 	// 2. Player API для выбранных клиентов.
 	clients := env.ArgList(ieKey, "player_client")
@@ -110,7 +112,7 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 			continue
 		}
 		responses = append(responses, pr)
-		for _, f := range parseFormats(ctx, env, c, pr) {
+		for _, f := range parseFormats(ctx, env, c, pr, jsURL) {
 			key := f.FormatID
 			if seen[key] {
 				continue
@@ -198,32 +200,119 @@ func playability(id string, pr any) error {
 
 var reMimeCodecs = regexp.MustCompile(`^([^;]+);\s*codecs="([^"]*)"`)
 
-func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any) []*media.Format {
+func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL string) []*media.Format {
 	sd := ex.Map(pr, "streamingData")
 	var out []*media.Format
+
+	// Плеер нужен только при наличии зашифрованных подписей или n-параметров.
+	// Загружаем лениво и один раз на клиента; кеш в getPlayer общий по URL.
+	var (
+		pl      *player
+		plTried bool
+		plErr   error
+	)
+	ensurePlayer := func() *player {
+		if !plTried {
+			plTried = true
+			if jsURL == "" {
+				plErr = fmt.Errorf("player JS URL not found")
+			} else {
+				pl, plErr = getPlayer(ctx, env, jsURL)
+			}
+			if plErr != nil {
+				env.Debug("youtube: signature decryption unavailable", "client", c.Name, "err", plErr)
+			}
+		}
+		return pl
+	}
+
 	skippedCipher := 0
 	for _, list := range []string{"formats", "adaptiveFormats"} {
 		for _, raw := range ex.Slice(sd, list) {
 			fm, _ := raw.(map[string]any)
 			u := ex.Str(fm, "url")
 			if u == "" {
-				if ex.Str(fm, "signatureCipher") != "" || ex.Str(fm, "cipher") != "" {
-					skippedCipher++
+				cipher := ex.FirstStr(fm, ex.P("signatureCipher"), ex.P("cipher"))
+				if cipher == "" {
+					continue
 				}
-				continue
+				decoded, err := decipherURL(ensurePlayer(), cipher)
+				if err != nil {
+					skippedCipher++
+					continue
+				}
+				u = decoded
 			}
+			u = applyNTransform(env, ensurePlayer(), u)
 			if f := parseFormat(fm, u, c); f != nil {
 				out = append(out, f)
 			}
 		}
 	}
 	if skippedCipher > 0 {
-		env.Warn("youtube: skipped formats that require signature deciphering (JS player is not supported)", "client", c.Name, "count", skippedCipher)
+		env.Warn("youtube: skipped formats whose signature could not be decrypted (this player version may be unsupported)", "client", c.Name, "count", skippedCipher)
 	}
 	if hlsURL := ex.Str(sd, "hlsManifestUrl"); hlsURL != "" {
 		out = append(out, hlsFormats(ctx, env, c, hlsURL)...)
 	}
 	return out
+}
+
+// decipherURL разбирает signatureCipher (s, sp, url), расшифровывает подпись
+// и возвращает готовый URL с добавленным параметром подписи.
+func decipherURL(pl *player, cipher string) (string, error) {
+	if pl == nil {
+		return "", fmt.Errorf("no player")
+	}
+	q, err := url.ParseQuery(cipher)
+	if err != nil {
+		return "", err
+	}
+	u, s := q.Get("url"), q.Get("s")
+	if u == "" || s == "" {
+		return "", fmt.Errorf("cipher missing url or s")
+	}
+	sig, err := pl.decryptSig(s)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return "", err
+	}
+	param := q.Get("sp")
+	if param == "" {
+		param = "signature"
+	}
+	vals := parsed.Query()
+	vals.Set(param, sig)
+	parsed.RawQuery = vals.Encode()
+	return parsed.String(), nil
+}
+
+// applyNTransform преобразует throttling-параметр n в URL, если это возможно;
+// при неудаче URL возвращается без изменений (загрузка просто медленнее).
+func applyNTransform(env *ex.Env, pl *player, rawURL string) string {
+	if pl == nil {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	n := q.Get("n")
+	if n == "" {
+		return rawURL
+	}
+	out, ok := pl.decryptN(n)
+	if !ok {
+		env.Debug("youtube: n-parameter transform failed; download may be throttled")
+		return rawURL
+	}
+	q.Set("n", out)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func parseFormat(fm map[string]any, u string, c *Client) *media.Format {

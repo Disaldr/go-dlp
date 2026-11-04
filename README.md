@@ -312,11 +312,14 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
 
 ## Ограничения
 
-- YouTube: только клиенты без JS-плеера (по умолчанию `visionos`); подписи, n-параметр и PO Token не
-  поддерживаются — форматы, которым они нужны, пропускаются.
+- YouTube: по умолчанию клиент без JS-плеера (`visionos`) с готовыми URL. Расшифровка подписи и
+  n-параметра через JS (goja) реализована для «классических» плееров и включается опционально
+  (`--extractor-args youtube:player_client=tv`), но новейшие es6-плееры YouTube и PO Token пока не
+  поддерживаются.
 - DASH: в статических манифестах берётся первый Period, живые — только SegmentTemplate; DRM не поддерживается.
-- Нет чтения cookies напрямую из браузера и логина по паролю — используйте `--cookies` с файлом,
-  выгруженным расширением браузера (Netscape `cookies.txt` или JSON-экспорт Cookie-Editor/EditThisCookie).
+- Логин по паролю не поддерживается — используйте `--cookies` (Netscape `cookies.txt` или JSON-экспорт
+  Cookie-Editor/EditThisCookie) либо `--cookies-from-browser BROWSER[:PROFILE]` (Firefox, Chromium-браузеры
+  с расшифровкой средствами ОС, Safari на macOS).
 - Не реализованы: Mixcloud (поток намеренно зашифрован сайтом против скачивания), Rumble и SpankBang
   (Cloudflare блокирует запросы).
 
