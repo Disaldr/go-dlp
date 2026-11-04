@@ -88,7 +88,7 @@ func NewRootCommand() *cobra.Command {
 	fl.StringVar(&f.ffmpeg, "ffmpeg-location", "", "путь к ffmpeg или каталогу с ним")
 	fl.StringVar(&f.userAgent, "user-agent", "", "User-Agent")
 	fl.StringVar(&f.proxy, "proxy", "", "прокси, напр. socks5://127.0.0.1:1080")
-	fl.StringVar(&f.cookies, "cookies", "", "файл cookies в формате Netscape (cookies.txt)")
+	fl.StringVar(&f.cookies, "cookies", "", "файл cookies: Netscape cookies.txt или JSON-экспорт расширения браузера")
 	fl.StringVar(&f.impersonate, "impersonate", "", `имитировать браузер во всех запросах: any, chrome, chrome:131, safari, firefox...`)
 	fl.BoolVar(&f.listImpersonate, "list-impersonate-targets", false, "список целей имитации браузера")
 	fl.StringArrayVar(&f.extractorArgs, "extractor-args", nil, `аргументы экстрактора "IE:key=v1,v2;key2=v" (повторяемый)`)

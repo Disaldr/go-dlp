@@ -58,7 +58,8 @@ type Options struct {
 	HTTPClient *http.Client
 	Proxy      string
 	UserAgent  string
-	// CookiesFile — файл cookies в формате Netscape (как --cookies в yt-dlp).
+	// CookiesFile — файл cookies: Netscape cookies.txt (как --cookies в yt-dlp)
+	// или JSON-экспорт расширения браузера (Cookie-Editor, EditThisCookie).
 	CookiesFile string
 	// Impersonate — имитировать браузер во всех запросах ("any", "chrome", "safari-16.0"...).
 	// Экстракторы могут включать имитацию и для отдельных запросов сами.

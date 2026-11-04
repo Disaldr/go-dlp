@@ -2,6 +2,8 @@ package extractor
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,15 +14,75 @@ import (
 	"time"
 )
 
-// LoadCookiesFile загружает cookies в формате Netscape (cookies.txt,
-// как --cookies в yt-dlp) в jar клиента. Возвращает число загруженных cookies.
+// LoadCookiesFile загружает cookies в jar клиента. Поддерживаются формат
+// Netscape (cookies.txt, как --cookies в yt-dlp) и JSON-экспорт расширений
+// браузера (Cookie-Editor, EditThisCookie и аналоги): массив объектов
+// {domain, name, value, path, secure, httpOnly, expirationDate}.
+// Возвращает число загруженных cookies.
 func LoadCookiesFile(client *http.Client, path string) (int, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
-	return LoadCookies(client, f)
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '[' {
+		return LoadCookiesJSON(client, trimmed)
+	}
+	return LoadCookies(client, bytes.NewReader(data))
+}
+
+// jsonCookie — запись JSON-экспорта cookies из расширения браузера.
+type jsonCookie struct {
+	Domain         string  `json:"domain"`
+	Name           string  `json:"name"`
+	Value          string  `json:"value"`
+	Path           string  `json:"path"`
+	Secure         bool    `json:"secure"`
+	HTTPOnly       bool    `json:"httpOnly"`
+	HostOnly       bool    `json:"hostOnly"`
+	Session        bool    `json:"session"`
+	ExpirationDate float64 `json:"expirationDate"`
+}
+
+// LoadCookiesJSON читает JSON-экспорт cookies (см. LoadCookiesFile).
+func LoadCookiesJSON(client *http.Client, data []byte) (int, error) {
+	if client == nil || client.Jar == nil {
+		return 0, fmt.Errorf("cookies: HTTP client has no cookie jar")
+	}
+	var list []jsonCookie
+	if err := json.Unmarshal(data, &list); err != nil {
+		return 0, fmt.Errorf("cookies: invalid JSON export: %w", err)
+	}
+	byHost := map[string][]*http.Cookie{}
+	for _, jc := range list {
+		host := strings.TrimPrefix(jc.Domain, ".")
+		if host == "" || jc.Name == "" {
+			continue
+		}
+		c := &http.Cookie{Name: jc.Name, Value: jc.Value, Path: jc.Path, Secure: jc.Secure, HttpOnly: jc.HTTPOnly}
+		if c.Path == "" {
+			c.Path = "/"
+		}
+		if !jc.HostOnly {
+			c.Domain = "." + host
+		}
+		if !jc.Session && jc.ExpirationDate > 0 {
+			c.Expires = time.Unix(int64(jc.ExpirationDate), 0)
+			if c.Expires.Before(time.Now()) {
+				continue
+			}
+		}
+		byHost[host] = append(byHost[host], c)
+	}
+	return setCookies(client, byHost), nil
+}
+
+func setCookies(client *http.Client, byHost map[string][]*http.Cookie) int {
+	n := 0
+	for host, cs := range byHost {
+		client.Jar.SetCookies(&url.URL{Scheme: "https", Host: host, Path: "/"}, cs)
+		n += len(cs)
+	}
+	return n
 }
 
 // LoadCookies читает cookies в формате Netscape из r.
@@ -69,13 +131,7 @@ func LoadCookies(client *http.Client, r io.Reader) (int, error) {
 	if err := sc.Err(); err != nil {
 		return 0, err
 	}
-	n := 0
-	for host, cs := range byHost {
-		u := &url.URL{Scheme: "https", Host: host, Path: "/"}
-		client.Jar.SetCookies(u, cs)
-		n += len(cs)
-	}
-	return n, nil
+	return setCookies(client, byHost), nil
 }
 
 // Cookie возвращает значение cookie для URL из jar окружения ("" если нет).

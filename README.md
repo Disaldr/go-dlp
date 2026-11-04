@@ -29,7 +29,7 @@ go-dlp -f "bv*[height<=720]+ba/b" URL                # выбор формато
 go-dlp -o "%(uploader)s/%(title)s.%(ext)s" URL       # шаблон имени файла
 go-dlp -j URL | jq .title                            # JSON без загрузки
 go-dlp --playlist-end 5 -e "ytsearch10:golang"       # поиск, первые 5 названий
-go-dlp --cookies cookies.txt URL                     # cookies (формат Netscape)
+go-dlp --cookies cookies.txt URL                     # cookies: Netscape cookies.txt или JSON-экспорт
 go-dlp --impersonate chrome URL                      # имитация браузера
 go-dlp extractors                                    # список экстракторов
 go-dlp --help                                        # все флаги
@@ -315,7 +315,8 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
 - YouTube: только клиенты без JS-плеера (по умолчанию `visionos`); подписи, n-параметр и PO Token не
   поддерживаются — форматы, которым они нужны, пропускаются.
 - DASH: в статических манифестах берётся первый Period, живые — только SegmentTemplate; DRM не поддерживается.
-- Нет чтения cookies напрямую из браузера и логина по паролю — используйте `--cookies`.
+- Нет чтения cookies напрямую из браузера и логина по паролю — используйте `--cookies` с файлом,
+  выгруженным расширением браузера (Netscape `cookies.txt` или JSON-экспорт Cookie-Editor/EditThisCookie).
 - Не реализованы: Mixcloud (поток намеренно зашифрован сайтом против скачивания), Rumble и SpankBang
   (Cloudflare блокирует запросы).
 
