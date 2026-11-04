@@ -161,6 +161,18 @@ func (g *Generic) fromHTML(ctx context.Context, env *ex.Env, rawURL, pageURL, id
 		}
 	}
 
+	// 1b. Встраивания известных плееров прямо в разметку (не через iframe):
+	// Brightcove, Wistia, JWPlayer, Kaltura — один детектор на множество сайтов.
+	for _, u := range detectInlineEmbeds(page) {
+		if seen[u] {
+			continue
+		}
+		if _, ok := env.FindEmbedded(u, ieKey); ok {
+			seen[u] = true
+			embeds = append(embeds, u)
+		}
+	}
+
 	// 2. Собственные медиа страницы.
 	var candidates []string
 	addCand := func(u string) {

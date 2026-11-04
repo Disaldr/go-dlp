@@ -160,7 +160,7 @@ fmt.Println(<-events)
 | PeerTube | `peertube` (любой инстанс) |
 | 18+ | `xvideos`, `xnxx`, `pornhub`, `redtube`, `youporn`, `xhamster`, `eporner` |
 | Embed-плееры | `brightcove`, `kaltura`, `jwplayer`, `wistia` (JS; передавайте URL самого embed/плеера) |
-| Остальное | `generic`: прямые ссылки, m3u8, mpd, `<video>`, og:video, JSON-LD, iframe-встраивания |
+| Остальное | `generic`: прямые ссылки, m3u8, mpd, `<video>`, og:video, JSON-LD, iframe- и inline-встраивания (Brightcove/Wistia/JWPlayer/Kaltura) |
 
 Экстракторы с пометкой «JS» написаны на JavaScript и обновляются без нового релиза
 (`--update-extractors`, `Client.Scripts()`), см. [docs/script-extractors.md](docs/script-extractors.md).
