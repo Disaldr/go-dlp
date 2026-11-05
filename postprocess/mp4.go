@@ -97,6 +97,10 @@ func findPath(b []byte, path ...string) (breg, bool) {
 	return last, true
 }
 
+// fits сообщает, что в box r полезной нагрузки хватает ещё на need байт после
+// заголовка (для безопасного чтения/записи полей по фиксированным смещениям).
+func (r breg) fits(need int) bool { return r.size >= r.hdr+need }
+
 func makeBox(typ string, parts ...[]byte) []byte {
 	n := 8
 	for _, p := range parts {
@@ -217,10 +221,20 @@ func patchTkhdID(trak []byte, id uint32) error {
 	if !ok {
 		return fmt.Errorf("%w: trak without tkhd", ErrUnsupportedMux)
 	}
+	if !r.fits(1) {
+		return fmt.Errorf("%w: tkhd too small", ErrUnsupportedMux)
+	}
 	ver := trak[r.start+r.hdr]
-	o := r.start + r.hdr + 4 + 8 // v0: ver/flags + creation + modification
+	// v0: ver/flags(4) + creation(4) + modification(4) + track_ID(4)
+	// v1: ver/flags(4) + creation(8) + modification(8) + track_ID(4)
+	o := r.start + r.hdr + 4 + 8
+	need := 4 + 8 + 4
 	if ver == 1 {
 		o = r.start + r.hdr + 4 + 16
+		need = 4 + 16 + 4
+	}
+	if !r.fits(need) {
+		return fmt.Errorf("%w: tkhd too small for track_ID", ErrUnsupportedMux)
 	}
 	pb32(trak, o, id)
 	return nil
@@ -291,6 +305,9 @@ func mergeMP4Fragmented(out string, ins []*mp4in) error {
 		if !ok {
 			return fmt.Errorf("%w: mvex without trex", ErrUnsupportedMux)
 		}
+		if !tr.fits(8) {
+			return fmt.Errorf("%w: trex too small", ErrUnsupportedMux)
+		}
 		trex := sub(mvexBytes, tr)
 		pb32(trex, tr.hdr+4, uint32(i+1)) // track_ID
 		trexes = append(trexes, trex)
@@ -341,7 +358,7 @@ func mergeMP4Fragmented(out string, ins []*mp4in) error {
 
 // patchMoof переписывает sequence_number в mfhd и track_ID во всех tfhd.
 func patchMoof(moof []byte, trackID, seq uint32) {
-	if r, ok := findChild(moof, "mfhd"); ok {
+	if r, ok := findChild(moof, "mfhd"); ok && r.fits(8) {
 		pb32(moof, r.start+r.hdr+4, seq) // ver/flags(4) + sequence_number(4)
 	}
 	for _, traf := range childrenOf(moof) {
@@ -349,7 +366,7 @@ func patchMoof(moof []byte, trackID, seq uint32) {
 			continue
 		}
 		trafBytes := moof[traf.start : traf.start+traf.size]
-		if r, ok := findChild(trafBytes, "tfhd"); ok {
+		if r, ok := findChild(trafBytes, "tfhd"); ok && r.fits(8) {
 			pb32(moof, traf.start+r.start+r.hdr+4, trackID) // ver/flags(4) + track_ID(4)
 		}
 	}
@@ -402,9 +419,20 @@ func mergeMP4Progressive(out string, ins []*mp4in) error {
 			return fmt.Errorf("%w: no stco/co64", ErrUnsupportedMux)
 		}
 		cobAbs := stbl.start + cob.start
+		if !cob.fits(8) {
+			return fmt.Errorf("%w: stco/co64 too small", ErrUnsupportedMux)
+		}
 		count := int(be32(trak[cobAbs+cob.hdr+4:]))
 		if count != len(refs) {
 			return fmt.Errorf("%w: chunk count mismatch (%d stco vs %d probed)", ErrUnsupportedMux, count, len(refs))
+		}
+		entrySize := 4
+		if wide {
+			entrySize = 8
+		}
+		// Записи должны целиком помещаться в box.
+		if !cob.fits(8 + count*entrySize) {
+			return fmt.Errorf("%w: stco/co64 entries exceed box size", ErrUnsupportedMux)
 		}
 		plans = append(plans, plan{in, trak, refs, cobAbs + cob.hdr + 8, wide})
 	}

@@ -37,6 +37,19 @@ func container(path string) string {
 	return strings.ToLower(path[i+1:])
 }
 
+// safeMux исполняет fn, превращая любую панику (например, выход за границы при
+// разборе битого/враждебного контейнера) в ErrUnsupportedMux. Муксер читает
+// недоверенные байты из сети, поэтому паника недопустима — вместо падения
+// процесса вызывающий получит ошибку и сможет прибегнуть к ffmpeg.
+func safeMux(fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: muxer recovered from panic: %v", ErrUnsupportedMux, r)
+		}
+	}()
+	return fn()
+}
+
 // Merge объединяет дорожки inputs в файл out без перекодирования.
 func (g *GoMerger) Merge(ctx context.Context, out string, inputs []Input) error {
 	if len(inputs) == 0 {
@@ -44,12 +57,12 @@ func (g *GoMerger) Merge(ctx context.Context, out string, inputs []Input) error 
 	}
 	switch container(out) {
 	case "mp4":
-		if err := mergeMP4(out, inputs); err != nil {
+		if err := safeMux(func() error { return mergeMP4(out, inputs) }); err != nil {
 			return g.maybeFallbackMerge(ctx, out, inputs, err)
 		}
 		return nil
 	case "mkv":
-		if err := mergeMatroska(out, inputs); err != nil {
+		if err := safeMux(func() error { return mergeMatroska(out, inputs) }); err != nil {
 			return g.maybeFallbackMerge(ctx, out, inputs, err)
 		}
 		return nil
@@ -68,12 +81,12 @@ func (g *GoMerger) Remux(ctx context.Context, in, out string) error {
 	inputs := []Input{{Path: in}}
 	switch container(out) {
 	case "mp4":
-		if err := mergeMP4(out, inputs); err != nil {
+		if err := safeMux(func() error { return mergeMP4(out, inputs) }); err != nil {
 			return g.maybeFallbackRemux(ctx, in, out, err)
 		}
 		return nil
 	case "mkv":
-		if err := mergeMatroska(out, inputs); err != nil {
+		if err := safeMux(func() error { return mergeMatroska(out, inputs) }); err != nil {
 			return g.maybeFallbackRemux(ctx, in, out, err)
 		}
 		return nil
