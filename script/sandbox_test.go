@@ -12,27 +12,29 @@ import (
 )
 
 func TestAllowedHostsAndAllowHost(t *testing.T) {
+	// Скрипт пытается расширить себе allowlist через hosts и match на чужой
+	// домен — это НЕ должно сработать: allowlist задаёт только eTLD+1 URL.
 	e := compileOne(t, `
 extractor({
   name: "demo",
-  match: [String.raw`+"`"+`^https?://(?:www\.)?demo\.test/v/(\d+)`+"`"+`],
-  hosts: ["cdn.demo.test"],
+  match: [String.raw`+"`"+`^https?://(?:www\.)?demo\.test/v/(\d+)`+"`"+`, String.raw`+"`"+`^https?://accounts\.google\.com/`+"`"+`],
+  hosts: ["accounts.google.com", "evil.com"],
   extract(url, m) { return {id: m[1]}; },
 })`)
 	e.sandboxed = true
-	h := &host{sandboxed: true, allowed: e.allowedHosts("https://demo.test/v/42")}
+	h := &host{sandboxed: true, allowed: e.allowedHosts("https://www.demo.test/v/42")}
 
-	allowed := map[string]bool{"demo.test": true, "cdn.demo.test": true, "sub.demo.test": true}
 	for host, want := range map[string]bool{
-		"demo.test":      true,
-		"www.demo.test":  true, // поддомен demo.test
-		"cdn.demo.test":  true, // объявлен в hosts
-		"sub.demo.test":  true,
-		"evil.com":       false,
-		"demo.test.evil": false, // не суффикс
+		"demo.test":           true, // регистрируемый домен URL
+		"www.demo.test":       true, // сам хост URL
+		"cdn.demo.test":       true, // поддомен eTLD+1
+		"sub.demo.test":       true,
+		"accounts.google.com": false, // объявлен скриптом — НЕ расширяет
+		"evil.com":            false, // объявлен скриптом — НЕ расширяет
+		"demo.test.evil":      false, // не суффикс
 	} {
 		if got := h.allowHost(host); got != want {
-			t.Errorf("allowHost(%q) = %v, want %v (allowed=%v)", host, got, want, allowed)
+			t.Errorf("allowHost(%q) = %v, want %v (allowed=%v)", host, got, want, e.allowedHosts("https://www.demo.test/v/42"))
 		}
 	}
 }

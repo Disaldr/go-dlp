@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"golang.org/x/net/publicsuffix"
 
 	ex "github.com/Disaldr/go-dlp/extractor"
 	"github.com/Disaldr/go-dlp/media"
@@ -51,7 +52,7 @@ type Extractor struct {
 	description string
 	priority    int
 	patterns    []*regexp.Regexp
-	hosts       []string // объявленный скриптом allowlist хостов (host.allowed)
+	hosts       []string // подсказка от скрипта (в песочнице НЕ расширяет allowlist)
 	sandboxed   bool     // источник недоверенный (сетевое обновление)
 
 	file    string
@@ -73,48 +74,25 @@ func (e *Extractor) Source() string { return e.file }
 // Fallback — подменённый встроенный экстрактор (или nil).
 func (e *Extractor) Fallback() ex.Extractor { return e.fallback }
 
-// allowedHosts — allowlist хостов для сендбоксного скрипта: объявленные в
-// скрипте hosts, плюс хосты, извлечённые из match-шаблонов, плюс хост самого
-// извлекаемого URL (его сайт экстрактор обрабатывает по определению).
+// allowedHosts — allowlist хостов для сендбоксного скрипта. ВАЖНО: берётся
+// только из извлекаемого URL — его регистрируемого домена (eTLD+1), — а НЕ из
+// объявленных скриптом hosts или match-шаблонов. Иначе недоверенный скрипт мог
+// бы сам расширить себе allowlist (напр. hosts:["accounts.google.com"]) и так
+// прочитать/переслать cookies чужого домена, обойдя песочницу. В результате
+// cookies доступны скрипту лишь в пределах регистрируемого домена того сайта,
+// URL которого обрабатывается.
 func (e *Extractor) allowedHosts(rawURL string) []string {
-	set := map[string]bool{}
-	add := func(h string) {
-		h = strings.ToLower(strings.TrimPrefix(h, "www."))
-		if h != "" {
-			set[h] = true
-		}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
 	}
-	for _, h := range e.hosts {
-		add(h)
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return nil
 	}
-	for _, re := range e.patterns {
-		for _, h := range hostsFromPattern(re.String()) {
-			add(h)
-		}
-	}
-	if u, err := url.Parse(rawURL); err == nil {
-		add(u.Hostname())
-	}
-	out := make([]string, 0, len(set))
-	for h := range set {
-		out = append(out, h)
-	}
-	return out
-}
-
-// reHostInPattern вытаскивает литеральный хост из исходника регулярки
-// (часть после http(s)://, с необязательным (?:www\.)? и до первого
-// спецсимвола/разделителя пути).
-var reHostInPattern = regexp.MustCompile(`https?://(?:\(\?:www\\\.\)\?|www\\\.)?([a-zA-Z0-9.\\-]+)`)
-
-func hostsFromPattern(src string) []string {
-	var out []string
-	for _, m := range reHostInPattern.FindAllStringSubmatch(src, -1) {
-		h := strings.ReplaceAll(m[1], `\`, "")
-		h = strings.TrimSuffix(h, ".")
-		if strings.Contains(h, ".") {
-			out = append(out, strings.TrimPrefix(h, "www."))
-		}
+	out := []string{host}
+	if reg, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil && reg != "" && reg != host {
+		out = append(out, reg)
 	}
 	return out
 }
@@ -293,8 +271,9 @@ func parseDefinition(vm *goja.Runtime, v goja.Value) (*definition, error) {
 	if len(d.patterns) == 0 {
 		return nil, fmt.Errorf("extractor %q: match is empty", d.name)
 	}
-	// hosts — необязательный allowlist хостов для сетевых запросов скрипта
-	// (сверх хостов из match). Используется только в песочнице.
+	// hosts — необязательная подсказка о доменах. В песочнице НЕ расширяет
+	// allowlist (его задаёт только домен извлекаемого URL — см. allowedHosts),
+	// чтобы недоверенный скрипт не мог сам себе открыть cookies чужих доменов.
 	if hv := o.Get("hosts"); hv != nil && !goja.IsUndefined(hv) && !goja.IsNull(hv) {
 		if arr, ok := hv.Export().([]any); ok {
 			for _, h := range arr {
