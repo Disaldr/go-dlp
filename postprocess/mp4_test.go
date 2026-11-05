@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	mp4 "github.com/abema/go-mp4"
 	"github.com/Disaldr/go-dlp/media"
+	mp4 "github.com/abema/go-mp4"
 )
 
 // probeTracks открывает MP4 и возвращает его дорожки.
@@ -47,10 +47,10 @@ func ffmpegDecodes(t *testing.T, path string) {
 
 func TestMergeMP4(t *testing.T) {
 	cases := []struct {
-		name          string
-		video, audio  string
-		wantVCodec    mp4.Codec
-		wantACodec    mp4.Codec
+		name         string
+		video, audio string
+		wantVCodec   mp4.Codec
+		wantACodec   mp4.Codec
 	}{
 		{"fragmented", "testdata/vfrag.mp4", "testdata/afrag.mp4", mp4.CodecAVC1, mp4.CodecMP4A},
 		{"progressive", "testdata/vprog.mp4", "testdata/aprog.m4a", mp4.CodecAVC1, mp4.CodecMP4A},
