@@ -155,6 +155,22 @@ wg.Wait()
 
 Есть и `DownloadInfoWith` / `DownloadVideoWith` / `PrepareWith` для уже извлечённой `*media.Info`.
 
+### Прямые ссылки на поток (без скачивания)
+
+Для трансляций (Twitch, YouTube Live) и вообще стриминга можно получить адрес
+манифеста HLS/DASH с нужными заголовками и отдать его внешнему плееру, ничего
+не скачивая:
+
+```go
+links, _ := client.StreamLinks(ctx, "https://www.twitch.tv/somechannel")
+for _, l := range links {
+	fmt.Println(l.URL, l.Protocol, l.IsLive) // master .m3u8 + заголовки в l.Headers
+}
+```
+
+Для HLS/DASH возвращается адрес манифеста (плеер сам выбирает качество); для
+прогрессивных сайтов — прямой URL лучшего формата. CLI: `go-dlp -g URL`.
+
 ### Слияние без ffmpeg и свой муксер
 
 Склейка дорожек описана интерфейсом `postprocess.Merger`; реализация выбирается

@@ -600,6 +600,82 @@ func (c *Client) prepare(info *media.Info, co callOpts) ([]*media.Info, error) {
 	return out, nil
 }
 
+// StreamLink — прямая ссылка на поток для передачи внешнему плееру без
+// скачивания. Для HLS/DASH это адрес манифеста (master .m3u8 / .mpd), чтобы
+// плеер сам выбирал качество; для прогрессивных форматов — прямой URL файла.
+type StreamLink struct {
+	URL      string            // манифест или прямой медиа-URL
+	Protocol string            // media.ProtoHLS / ProtoDASH / ProtoHTTPS ...
+	Headers  map[string]string // заголовки, которые плеер должен слать при запросах
+	IsLive   bool
+	FormatID string // для прогрессивных ссылок (для манифеста пусто)
+	Note     string
+}
+
+// StreamLinks извлекает URL (без загрузки) и возвращает прямые ссылки на
+// потоки: адрес манифеста для HLS/DASH (например, Twitch и YouTube Live) или
+// прямые URL прогрессивных форматов — всё с нужными заголовками. Плейлисты не
+// разворачиваются (используйте Walk + StreamLinksInfo на каждый элемент).
+func (c *Client) StreamLinks(ctx context.Context, rawURL string) ([]StreamLink, error) {
+	info, err := c.Extract(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return c.StreamLinksInfo(info)
+}
+
+// StreamLinksInfo — как StreamLinks, но для уже извлечённой информации.
+func (c *Client) StreamLinksInfo(info *media.Info) ([]StreamLink, error) {
+	if info.Kind == media.KindPlaylist {
+		return nil, fmt.Errorf("stream links: %s is a playlist; use Walk and StreamLinksInfo per entry", info.ID)
+	}
+	if len(info.Formats) == 0 {
+		return nil, fmt.Errorf("%s: %w", info.ID, extractor.ErrNoFormats)
+	}
+	var links []StreamLink
+	seen := map[string]bool{}
+	// Манифесты HLS/DASH: отдаём адрес манифеста (плеер выберет качество сам),
+	// схлопывая варианты с общим ManifestURL в одну ссылку.
+	for _, f := range info.Formats {
+		if f.Protocol != media.ProtoHLS && f.Protocol != media.ProtoDASH {
+			continue
+		}
+		man := f.ManifestURL
+		if man == "" {
+			man = f.URL
+		}
+		if man == "" || seen[man] {
+			continue
+		}
+		seen[man] = true
+		links = append(links, StreamLink{
+			URL: man, Protocol: f.Protocol, Headers: info.Headers(f),
+			IsLive: info.IsLive || f.Live,
+		})
+	}
+	if len(links) > 0 {
+		return links, nil
+	}
+	// Прогрессивные форматы: лучший по умолчанию (предпочитая единый файл).
+	sels, err := c.selectFormats(info, "b/bv*+ba", c.defaults())
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range sels {
+		for _, f := range s {
+			if f.URL == "" || seen[f.URL] {
+				continue
+			}
+			seen[f.URL] = true
+			links = append(links, StreamLink{
+				URL: f.URL, Protocol: f.Protocol, Headers: info.Headers(f),
+				IsLive: info.IsLive || f.Live, FormatID: f.FormatID, Note: f.FormatNote,
+			})
+		}
+	}
+	return links, nil
+}
+
 // Result — итог загрузки одного видео.
 type Result struct {
 	Info     *media.Info
