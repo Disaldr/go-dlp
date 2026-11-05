@@ -31,7 +31,7 @@ func New() *Generic { return &Generic{} }
 
 func (*Generic) Name() string { return ieKey }
 func (*Generic) Description() string {
-	return "Generic: direct links, HLS, HTML5 video, og:video, embeds"
+	return "Generic: direct links, HLS, HTML5 video, og:video, embeds (with anti-bot browser impersonation)"
 }
 func (*Generic) Priority() int { return ex.PriorityFallback }
 func (*Generic) Suitable(u string) bool {
@@ -52,8 +52,10 @@ func idFromURL(u string) string {
 
 func (g *Generic) Extract(ctx context.Context, env *ex.Env, rawURL string) (*media.Info, error) {
 	id := idFromURL(rawURL)
-	// Открываем поток и смотрим Content-Type, не скачивая весь файл.
-	resp, err := env.Open(ctx, ex.Request{URL: rawURL})
+	// Открываем поток и смотрим Content-Type, не скачивая весь файл. Если сайт
+	// отвечает анти-бот-заслоном (Cloudflare и т.п.), повторяем с имитацией
+	// браузера — нужно онлайн-кинотеатрам и другим защищённым сайтам.
+	resp, imp, err := openAntiBot(ctx, env, rawURL)
 	if err != nil {
 		return nil, ex.Wrap(ieKey, id, err, "unable to open URL")
 	}
@@ -75,7 +77,7 @@ func (g *Generic) Extract(ctx context.Context, env *ex.Env, rawURL string) (*med
 	if ext != "" && ext != "m3u8" && ext != "mpd" &&
 		(strings.HasPrefix(ctype, "video/") || strings.HasPrefix(ctype, "audio/") || ex.KnownMediaExts[ext]) {
 		resp.Body.Close()
-		f := &media.Format{FormatID: ext, URL: finalURL, Ext: ext, Protocol: protocol(finalURL), Filesize: max(resp.ContentLength, 0)}
+		f := &media.Format{FormatID: ext, URL: finalURL, Ext: ext, Protocol: protocol(finalURL), Filesize: max(resp.ContentLength, 0), Impersonate: imp}
 		if strings.HasPrefix(ctype, "audio/") {
 			f.VCodec = media.CodecNone
 		}
@@ -90,6 +92,7 @@ func (g *Generic) Extract(ctx context.Context, env *ex.Env, rawURL string) (*med
 	// HLS-плейлист.
 	if ext == "m3u8" || strings.HasPrefix(strings.TrimSpace(body), "#EXTM3U") {
 		fs := hls.ParseMaster(body, finalURL, "hls")
+		setImpersonate(fs, imp)
 		return &media.Info{Kind: media.KindVideo, ID: id, Title: id, WebpageURL: rawURL, Formats: fs}, nil
 	}
 
@@ -99,10 +102,40 @@ func (g *Generic) Extract(ctx context.Context, env *ex.Env, rawURL string) (*med
 		if err != nil {
 			return nil, ex.Wrap(ieKey, id, err, "unable to parse DASH manifest")
 		}
+		setImpersonate(m.Formats, imp)
 		return &media.Info{Kind: media.KindVideo, ID: id, Title: id, WebpageURL: rawURL, Formats: m.Formats, IsLive: m.Dynamic}, nil
 	}
 
-	return g.fromHTML(ctx, env, rawURL, finalURL, id, body)
+	return g.fromHTML(ctx, env, rawURL, finalURL, id, body, imp)
+}
+
+// openAntiBot открывает URL; при признаках анти-бот-защиты и если имитация
+// ещё не включена глобально, повторяет запрос с имитацией браузера ("any").
+// Возвращает ответ и использованную цель имитации (""/"any").
+func openAntiBot(ctx context.Context, env *ex.Env, rawURL string) (*http.Response, string, error) {
+	resp, err := env.Open(ctx, ex.Request{URL: rawURL})
+	if err != nil {
+		return nil, "", err
+	}
+	if env.ImpersonateTarget("") != "" || !blocked(resp) {
+		return resp, env.ImpersonateTarget(""), nil
+	}
+	env.Debug("generic: anti-bot response, retrying with browser impersonation", "url", rawURL, "status", resp.StatusCode)
+	resp2, err2 := env.Open(ctx, ex.Request{URL: rawURL, Impersonate: "any"})
+	if err2 != nil {
+		return resp, "", nil // оставляем исходный ответ
+	}
+	resp.Body.Close()
+	return resp2, "any", nil
+}
+
+// blocked распознаёт типичный анти-бот-ответ (Cloudflare и подобные).
+func blocked(resp *http.Response) bool {
+	switch resp.StatusCode {
+	case 403, 429, 503:
+		return true
+	}
+	return false
 }
 
 // maxPage — сколько HTML читаем для поиска видео.
@@ -123,7 +156,19 @@ func protocol(u string) string {
 
 var reM3U8 = regexp.MustCompile(`https?:\\?/\\?/[^"'\s<>]+?\.m3u8(?:\?[^"'\s<>]*)?`)
 
-func (g *Generic) fromHTML(ctx context.Context, env *ex.Env, rawURL, pageURL, id, page string) (*media.Info, error) {
+// setImpersonate проставляет цель имитации всем форматам (пусто — ничего).
+func setImpersonate(fs []*media.Format, imp string) {
+	if imp == "" {
+		return
+	}
+	for _, f := range fs {
+		if f.Impersonate == "" {
+			f.Impersonate = imp
+		}
+	}
+}
+
+func (g *Generic) fromHTML(ctx context.Context, env *ex.Env, rawURL, pageURL, id, page, imp string) (*media.Info, error) {
 	title := ex.MetaContent(page, "og:title", "twitter:title")
 	if title == "" {
 		title = ex.HTMLTitle(page)
@@ -239,8 +284,9 @@ func (g *Generic) fromHTML(ctx context.Context, env *ex.Env, rawURL, pageURL, id
 	for i, c := range candidates {
 		ext := ex.URLExt(c)
 		if ext == "mpd" {
-			if r, err := env.Fetch(ctx, ex.Request{URL: c}); err == nil {
+			if r, err := env.Fetch(ctx, ex.Request{URL: c, Impersonate: imp}); err == nil {
 				if fs, err := dash.Parse(r.Body, r.URL, "dash-"+itoa(i)); err == nil {
+					setImpersonate(fs, imp)
 					info.Formats = append(info.Formats, fs...)
 				}
 			}
@@ -248,14 +294,14 @@ func (g *Generic) fromHTML(ctx context.Context, env *ex.Env, rawURL, pageURL, id
 		}
 		if ext == "m3u8" {
 			info.Formats = append(info.Formats, &media.Format{
-				FormatID: "hls-" + itoa(i), URL: c, ManifestURL: c, Ext: "mp4", Protocol: media.ProtoHLS,
+				FormatID: "hls-" + itoa(i), URL: c, ManifestURL: c, Ext: "mp4", Protocol: media.ProtoHLS, Impersonate: imp,
 			})
 			continue
 		}
 		if ext == "" || !ex.KnownMediaExts[ext] {
 			ext = "mp4"
 		}
-		info.Formats = append(info.Formats, &media.Format{FormatID: ext + "-" + itoa(i), URL: c, Ext: ext, Protocol: protocol(c)})
+		info.Formats = append(info.Formats, &media.Format{FormatID: ext + "-" + itoa(i), URL: c, Ext: ext, Protocol: protocol(c), Impersonate: imp})
 	}
 
 	switch {
