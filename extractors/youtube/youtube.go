@@ -86,6 +86,7 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 	env.Debug("youtube: webpage config", "id", id, "visitor_data", visitor != "", "sts", sts, "player", jsURL != "", "logged_in", au != nil)
 
 	// 2. Player API для выбранных клиентов.
+	pot := parsePoTokens(env.ArgList(ieKey, "po_token"))
 	clients := env.ArgList(ieKey, "player_client")
 	var fallback []string
 	if len(clients) == 0 {
@@ -105,7 +106,7 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 			env.Warn("youtube: unknown player client, skipping", "client", name)
 			return
 		}
-		pr, err := playerRequest(ctx, env, c, id, visitor, sts, au)
+		pr, err := playerRequest(ctx, env, c, id, visitor, sts, au, pot)
 		if err != nil {
 			lastErr = err
 			env.Warn("youtube: player request failed", "client", name, "err", err)
@@ -117,7 +118,7 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 			return
 		}
 		responses = append(responses, pr)
-		fs, d := parseFormats(ctx, env, c, pr, jsURL)
+		fs, d := parseFormats(ctx, env, c, pr, jsURL, pot)
 		diag.skippedCipher += d.skippedCipher
 		diag.sabrOnly += d.sabrOnly
 		if d.playerErr != nil && errors.Is(d.playerErr, ex.ErrPlayerUnsupported) {
@@ -179,7 +180,7 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 	return info, nil
 }
 
-func playerRequest(ctx context.Context, env *ex.Env, c *Client, id, visitor string, sts int64, au *auth) (any, error) {
+func playerRequest(ctx context.Context, env *ex.Env, c *Client, id, visitor string, sts int64, au *auth, pot poTokens) (any, error) {
 	pbc := map[string]any{"html5Preference": "HTML5_PREF_WANTS"}
 	if sts > 0 {
 		pbc["signatureTimestamp"] = sts
@@ -190,6 +191,10 @@ func playerRequest(ctx context.Context, env *ex.Env, c *Client, id, visitor stri
 		"playbackContext": map[string]any{"contentPlaybackContext": pbc},
 		"contentCheckOk":  true,
 		"racyCheckOk":     true,
+	}
+	// Внешний PO Token для player API (BotGuard): привязывает запрос к сессии.
+	if t := pot.get(c.Name, "player"); t != "" {
+		body["serviceIntegrityDimensions"] = map[string]any{"poToken": t}
 	}
 	headers := map[string]string{
 		"Cookie":                   consentHeaders["Cookie"],
@@ -203,7 +208,9 @@ func playerRequest(ctx context.Context, env *ex.Env, c *Client, id, visitor stri
 	// отдаёт контент без GVS PO Token. С visitor data web-форматы требуют
 	// PO Token и без него возвращают HTTP 403.
 	authed := au != nil && c.SupportsCookies
-	if visitor != "" && (!c.Guest || authed) {
+	// При наличии внешнего PO Token гостевой режим не нужен: токен привязан к
+	// visitor data, поэтому его отправляем.
+	if visitor != "" && (!c.Guest || authed || pot.any(c.Name)) {
 		headers["X-Goog-Visitor-Id"] = visitor
 	}
 	if authed {
@@ -252,7 +259,8 @@ type formatDiag struct {
 	playerErr     error // ошибка загрузки/разбора плеера, если расшифровка требовалась
 }
 
-func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL string) ([]*media.Format, formatDiag) {
+func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL string, pot poTokens) ([]*media.Format, formatDiag) {
+	gvs := pot.get(c.Name, "gvs")
 	sd := ex.Map(pr, "streamingData")
 	var out []*media.Format
 	var diag formatDiag
@@ -297,6 +305,7 @@ func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL str
 				u = decoded
 			}
 			u = applyNTransform(env, ensurePlayer(), u)
+			u = withPot(u, gvs) // GVS PO Token (если задан) — параметр pot
 			if f := parseFormat(fm, u, c); f != nil {
 				out = append(out, f)
 			}

@@ -415,8 +415,11 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
   почти все форматы только через SABR (`serverAbrStreamingUrl`, без `url`/`signatureCipher`);
   SABR не поддерживается, такие форматы пропускаются с предупреждением (а если форматов не
   осталось вовсе — возвращается понятная ошибка; при неразбираемом base.js — `ErrPlayerUnsupported`).
-  PO Token не
-  поддерживается, клиент `tv` возвращает UNPLAYABLE, поэтому `web`/`tv` не включены по умолчанию.
+  PO Token нельзя сгенерировать в goja (BotGuard требует браузера), но его можно передать извне
+  (от браузера/провайдера) — тогда клиент `web` становится рабочим:
+  `--extractor-args "youtube:player_client=web;po_token=web.gvs+XXXX,web.player+YYYY"` (контексты
+  `gvs`/`player`/`subs`; ключ без клиента применяется ко всем). Клиент `tv` возвращает UNPLAYABLE,
+  поэтому `web`/`tv` не включены по умолчанию.
   Если `visionos` не дал форматов (например, «Sign in to confirm you're not a bot»),
   автоматически пробуется `tv_simply`: подписи и n расшифровываются в goja, PO Token не нужен.
   При cookies аккаунта запросы клиентов `web`/`tv` подписываются `SAPISIDHASH`.
