@@ -80,6 +80,12 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 	if visitor == "" {
 		visitor = ex.Str(initialPR, "responseContext", "visitorData")
 	}
+	// PO Token привязан к visitor data, с которым он сгенерирован; дать
+	// переопределить его, чтобы совпадало с токеном (как --extractor-args
+	// youtube:visitor_data=... в yt-dlp).
+	if v := env.Arg(ieKey, "visitor_data", ""); v != "" {
+		visitor = v
+	}
 	sts := ex.Int(ytcfg, "STS")
 	jsURL := playerURL(ytcfg, page)
 	au := sessionAuth(env, ytcfg)

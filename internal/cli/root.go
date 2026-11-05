@@ -18,6 +18,7 @@ import (
 	"github.com/Disaldr/go-dlp/extractor"
 	"github.com/Disaldr/go-dlp/impersonate"
 	"github.com/Disaldr/go-dlp/media"
+	"github.com/Disaldr/go-dlp/postprocess"
 	"github.com/Disaldr/go-dlp/script"
 )
 
@@ -39,6 +40,7 @@ type flags struct {
 	listExtractors                        bool
 	cookies                               string
 	cookiesFromBrowser                    string
+	merger                                string
 	username, password, twoFactor         string
 	netrc                                 bool
 	netrcFile                             string
@@ -80,6 +82,7 @@ func NewRootCommand() *cobra.Command {
 	fl.StringVarP(&f.output, "output", "o", "", "шаблон имени файла (по умолчанию \"%(title)s [%(id)s].%(ext)s\")")
 	fl.StringVarP(&f.paths, "paths", "P", "", "каталог для загрузки")
 	fl.StringVar(&f.mergeFormat, "merge-output-format", "", "контейнер при слиянии: mp4, mkv, webm...")
+	fl.StringVar(&f.merger, "merger", "auto", "муксер для слияния: auto, ffmpeg, go (встроенный на чистом Go)")
 	fl.BoolVarP(&f.listFormats, "list-formats", "F", false, "показать доступные форматы")
 	fl.BoolVarP(&f.dumpJSON, "dump-json", "j", false, "вывести JSON по каждому видео (без загрузки)")
 	fl.BoolVarP(&f.dumpSingleJSON, "dump-single-json", "J", false, "вывести JSON целиком (плейлист — одним объектом)")
@@ -225,7 +228,18 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 	if !f.quiet && !f.noProgress && !printOnly {
 		progress = newProgressPrinter(stderr)
 	}
+	var customMerger postprocess.Merger
+	var preferFFmpeg *bool
+	switch f.merger {
+	case "go":
+		customMerger = postprocess.NewGoMerger() // чистый Go, без ffmpeg
+	case "ffmpeg":
+		t := true
+		preferFFmpeg = &t
+	}
 	opts := dlp.Options{
+		Merger:              customMerger,
+		PreferFFmpeg:        preferFFmpeg,
 		Format:              f.format,
 		OutputTemplate:      f.output,
 		OutputDir:           f.paths,

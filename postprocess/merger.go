@@ -23,6 +23,21 @@ type Merger interface {
 // Клиент может обработать её запасным путём (например, сохранить HLS как .ts).
 var ErrUnsupportedMux = errors.New("muxer: unsupported container or codec")
 
+// CrossContainerMerger — необязательный интерфейс: умеет ли реализация
+// объединять дорожки из РАЗНЫХ семейств контейнеров (например, видео MP4 +
+// аудио WebM). ffmpeg умеет; встроенный Go-муксер — только одинаковые.
+type CrossContainerMerger interface {
+	CrossContainer() bool
+}
+
+// CanCrossContainer сообщает, умеет ли merger смешивать разные контейнеры.
+func CanCrossContainer(m Merger) bool {
+	if c, ok := m.(CrossContainerMerger); ok {
+		return c.CrossContainer()
+	}
+	return false
+}
+
 var (
 	_ Merger = (*FFmpeg)(nil)
 	_ Merger = (*GoMerger)(nil)

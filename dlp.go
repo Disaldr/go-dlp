@@ -566,10 +566,15 @@ func (c *Client) defaultFormat(co callOpts) string {
 	if co.format != "" {
 		return co.format
 	}
-	if c.merger != nil {
-		return "bv*+ba/b"
+	if c.merger == nil {
+		return "b/bv*+ba"
 	}
-	return "b/bv*+ba"
+	// Муксер без кросс-контейнера (встроенный Go без ffmpeg) не смешивает
+	// mp4-видео с webm-аудио, поэтому предпочитаем совместимые пары.
+	if !postprocess.CanCrossContainer(c.merger) {
+		return "bv*[ext=mp4]+ba[ext=m4a]/bv*[ext=webm]+ba[ext=webm]/bv*+ba/b"
+	}
+	return "bv*+ba/b"
 }
 
 // SelectFormats выбирает форматы по Options.Format (или переданному spec).

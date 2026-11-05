@@ -50,10 +50,38 @@ func safeMux(fn func() error) (err error) {
 	return fn()
 }
 
+// CrossContainer: встроенный Go-муксер смешивать разные контейнеры не умеет;
+// умеет только при наличии запасного ffmpeg.
+func (g *GoMerger) CrossContainer() bool { return g.Fallback != nil && CanCrossContainer(g.Fallback) }
+
+// mixedContainers сообщает, что входы относятся к разным семействам контейнеров
+// (mp4 vs mkv/webm) — встроенный муксер такое не склеивает.
+func mixedContainers(inputs []Input) bool {
+	var fam string
+	for _, in := range inputs {
+		c := container(in.Path)
+		if c != "mp4" && c != "mkv" {
+			continue
+		}
+		if fam == "" {
+			fam = c
+		} else if fam != c {
+			return true
+		}
+	}
+	return false
+}
+
 // Merge объединяет дорожки inputs в файл out без перекодирования.
 func (g *GoMerger) Merge(ctx context.Context, out string, inputs []Input) error {
 	if len(inputs) == 0 {
 		return fmt.Errorf("merge: no inputs")
+	}
+	if mixedContainers(inputs) {
+		// Видео и аудио в разных контейнерах (напр. AV1/MP4 + Opus/WebM):
+		// встроенный муксер их не смешивает (нужен MKV-кросс-мукс или ffmpeg).
+		return g.maybeFallbackMerge(ctx, out, inputs,
+			fmt.Errorf("%w: mixed containers (mp4+webm) need ffmpeg or same-container formats", ErrUnsupportedMux))
 	}
 	switch container(out) {
 	case "mp4":

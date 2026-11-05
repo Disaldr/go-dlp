@@ -140,3 +140,6 @@ func MergeExt(formats []*media.Format, preferred string) string {
 	}
 	return "mkv"
 }
+
+// CrossContainer: ffmpeg умеет смешивать дорожки из разных контейнеров.
+func (f *FFmpeg) CrossContainer() bool { return true }

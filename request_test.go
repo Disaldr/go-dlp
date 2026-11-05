@@ -1,10 +1,13 @@
 package dlp
 
 import (
+	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Disaldr/go-dlp/media"
+	"github.com/Disaldr/go-dlp/postprocess"
 )
 
 func ptrBool(b bool) *bool { return &b }
@@ -101,3 +104,30 @@ func TestPrepareWithOverrides(t *testing.T) {
 		t.Errorf("default Prepare dir = %q, want /base", dir)
 	}
 }
+
+func TestDefaultFormatByMergerCapability(t *testing.T) {
+	// Муксер без кросс-контейнера (встроенный Go без ffmpeg) → предпочитать
+	// совместимые пары.
+	cGo, err := New(Options{Merger: postprocess.NewGoMerger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cGo.DefaultFormat(); !strings.Contains(got, "ext=mp4") || !strings.Contains(got, "ext=webm") {
+		t.Errorf("Go-merger default format = %q, want same-container preference", got)
+	}
+
+	// Кросс-контейнерный муксер (ffmpeg-подобный) → обычный bv*+ba/b.
+	cCross, err := New(Options{Merger: crossMerger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cCross.DefaultFormat(); got != "bv*+ba/b" {
+		t.Errorf("cross-merger default format = %q, want bv*+ba/b", got)
+	}
+}
+
+type crossMerger struct{}
+
+func (crossMerger) Merge(context.Context, string, []postprocess.Input) error { return nil }
+func (crossMerger) Remux(context.Context, string, string) error              { return nil }
+func (crossMerger) CrossContainer() bool                                     { return true }
