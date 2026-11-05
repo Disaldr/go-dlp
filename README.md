@@ -425,7 +425,9 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
   При cookies аккаунта запросы клиентов `web`/`tv` подписываются `SAPISIDHASH`.
 - DASH: статические манифесты с несколькими Period склеиваются (сегменты одинаковых представлений);
   живые (dynamic) поддерживают SegmentTemplate и SegmentList у live-края; живой SegmentBase и DRM не поддерживаются.
-- Логин по паролю не поддерживается — используйте `--cookies` (Netscape `cookies.txt` или JSON-экспорт
+- Учётные данные: `-u/--username`, `-p/--password`, `--twofactor`, а также `--netrc`/`--netrc-location`
+  (формат `.netrc`) доступны экстракторам через `env.Credentials(machine)`; собственно процедуры входа
+  зависят от сайта. Универсальный способ авторизации — `--cookies` (Netscape `cookies.txt` или JSON-экспорт
   Cookie-Editor/EditThisCookie) либо `--cookies-from-browser BROWSER[:PROFILE]` (Firefox, Chromium-браузеры
   с расшифровкой средствами ОС, Safari на macOS).
 - JS-экстракторы из сетевых обновлений исполняются в песочнице: нет файловой системы и процессов,

@@ -42,6 +42,8 @@ type Env struct {
 	// Impersonator выдаёт клиентов с TLS-отпечатком браузера; nil — создаётся
 	// лениво поверх cookie-jar клиента HTTP.
 	Impersonator *impersonate.Pool
+	// Creds — учётные данные для входа (явные и/или из .netrc). Может быть nil.
+	Creds *CredStore
 }
 
 // ClientFor возвращает HTTP-клиент для цели имитации ("" — обычный клиент).

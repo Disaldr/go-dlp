@@ -76,6 +76,15 @@ type Options struct {
 	// Экстракторы могут включать имитацию и для отдельных запросов сами.
 	Impersonate string
 
+	// Username, Password, TwoFactor — учётные данные для входа (для
+	// экстракторов, поддерживающих логин). Приоритетнее .netrc.
+	Username, Password, TwoFactor string
+	// Netrc — читать учётные данные из файла .netrc.
+	Netrc bool
+	// NetrcFile — путь к .netrc (по умолчанию $HOME/.netrc; задание пути
+	// включает чтение .netrc независимо от Netrc).
+	NetrcFile string
+
 	// FFmpegLocation — путь к ffmpeg или каталогу с ним.
 	FFmpegLocation string
 	// Merger — реализация склейки/ремукса дорожек. Если nil, выбирается
@@ -234,11 +243,16 @@ func New(opts Options) (*Client, error) {
 		p, _ := url.Parse(opts.Proxy)
 		proxyFn = http.ProxyURL(p)
 	}
+	creds, err := buildCredStore(opts)
+	if err != nil {
+		return nil, err
+	}
 	c.env = &extractor.Env{
 		HTTP: hc, UserAgent: ua, Logger: c.log, Registry: c.reg,
 		Args: args, NoPlaylist: opts.NoPlaylist, MaxEntries: opts.PlaylistEnd,
 		Impersonate:  imp,
 		Impersonator: &impersonate.Pool{Jar: hc.Jar, Proxy: proxyFn},
+		Creds:        creds,
 	}
 	if opts.CookiesFromBrowser != "" {
 		n, err := extractor.LoadCookiesFromBrowser(hc, opts.CookiesFromBrowser)
@@ -266,6 +280,26 @@ func New(opts Options) (*Client, error) {
 		}
 	}
 	return c, nil
+}
+
+// buildCredStore собирает хранилище учётных данных из Options: явные
+// Username/Password и, при необходимости, записи из .netrc.
+func buildCredStore(opts Options) (*extractor.CredStore, error) {
+	var byMachine map[string]extractor.Login
+	path := opts.NetrcFile
+	if path == "" && opts.Netrc {
+		path = extractor.DefaultNetrcPath()
+	}
+	if path != "" {
+		m, err := extractor.LoadNetrc(path)
+		if err != nil {
+			return nil, fmt.Errorf("netrc: %w", err)
+		}
+		byMachine = m
+	}
+	store := extractor.NewCredStore(byMachine)
+	store.Default = extractor.Login{Username: opts.Username, Password: opts.Password, TwoFactor: opts.TwoFactor}
+	return store, nil
 }
 
 // Registry возвращает реестр экстракторов клиента.

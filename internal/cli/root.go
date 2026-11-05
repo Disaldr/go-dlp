@@ -39,6 +39,9 @@ type flags struct {
 	listExtractors                        bool
 	cookies                               string
 	cookiesFromBrowser                    string
+	username, password, twoFactor         string
+	netrc                                 bool
+	netrcFile                             string
 	impersonate                           string
 	listImpersonate                       bool
 	updateExtractors                      bool
@@ -96,6 +99,11 @@ func NewRootCommand() *cobra.Command {
 	fl.StringVar(&f.proxy, "proxy", "", "прокси, напр. socks5://127.0.0.1:1080")
 	fl.StringVar(&f.cookies, "cookies", "", "файл cookies: Netscape cookies.txt или JSON-экспорт расширения браузера")
 	fl.StringVar(&f.cookiesFromBrowser, "cookies-from-browser", "", "читать cookies из BROWSER[:PROFILE]: chrome, chromium, firefox, brave, edge, opera, vivaldi, whale, safari")
+	fl.StringVarP(&f.username, "username", "u", "", "логин для входа на сайт")
+	fl.StringVarP(&f.password, "password", "p", "", "пароль для входа на сайт")
+	fl.StringVar(&f.twoFactor, "twofactor", "", "код двухфакторной аутентификации")
+	fl.BoolVar(&f.netrc, "netrc", false, "брать учётные данные из ~/.netrc")
+	fl.StringVar(&f.netrcFile, "netrc-location", "", "путь к файлу .netrc (включает --netrc)")
 	fl.StringVar(&f.impersonate, "impersonate", "", `имитировать браузер во всех запросах: any, chrome, chrome:131, safari, firefox...`)
 	fl.BoolVar(&f.listImpersonate, "list-impersonate-targets", false, "список целей имитации браузера")
 	fl.StringArrayVar(&f.extractorArgs, "extractor-args", nil, `аргументы экстрактора "IE:key=v1,v2;key2=v" (повторяемый)`)
@@ -228,6 +236,11 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 		Proxy:               f.proxy,
 		CookiesFile:         f.cookies,
 		CookiesFromBrowser:  f.cookiesFromBrowser,
+		Username:            f.username,
+		Password:            f.password,
+		TwoFactor:           f.twoFactor,
+		Netrc:               f.netrc,
+		NetrcFile:           f.netrcFile,
 		ExtractorScriptsDir: f.extractorScripts,
 		Impersonate:         f.impersonate,
 		UserAgent:           f.userAgent,
