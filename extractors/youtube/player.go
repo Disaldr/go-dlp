@@ -214,7 +214,14 @@ func loadPlayer(ctx context.Context, env *ex.Env, jsURL string) (*player, error)
 	if err != nil {
 		return nil, fmt.Errorf("download player %s: %w", jsURL, err)
 	}
-	return newPlayer(ctx, code)
+	p, err := newPlayer(ctx, code)
+	if err != nil && ctx.Err() == nil && !errors.Is(err, ex.ErrPlayerUnsupported) {
+		// base.js скачан, но разобрать его не удалось: не найдена или не
+		// скомпилировалась функция расшифровки подписи — формат плеера
+		// изменился. Это сигнал обновить экстрактор (см. ErrPlayerUnsupported).
+		err = fmt.Errorf("%w: %w", ex.ErrPlayerUnsupported, err)
+	}
+	return p, err
 }
 
 // newPlayer собирает движок goja с функциями расшифровки из исходника base.js.

@@ -53,6 +53,14 @@ var (
 	ErrLoginRequired  = errors.New("login required")
 	ErrGeoRestricted  = errors.New("geo restricted")
 	ErrNoFormats      = errors.New("no formats found")
+	// ErrBotCheck — сайт потребовал пройти проверку «вы не робот»
+	// (YouTube BotGuard, Cloudflare challenge и т.п.). Обычно снимается
+	// валидными cookies браузера или PO Token.
+	ErrBotCheck = errors.New("bot check required")
+	// ErrPlayerUnsupported — не удалось обработать плеер сайта: изменился
+	// формат base.js, не найдена/не поддержана функция расшифровки подписи.
+	// Сигнал, что экстрактор нужно обновить под новую версию плеера.
+	ErrPlayerUnsupported = errors.New("player version not supported")
 )
 
 // Error — ошибка экстракции.

@@ -4,6 +4,7 @@ package youtube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -95,6 +96,8 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 		lastErr   error
 		formats   []*media.Format
 		seen      = map[string]bool{}
+		diag      formatDiag
+		playerErr error
 	)
 	try := func(name string) {
 		c, ok := Clients[name]
@@ -114,7 +117,13 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 			return
 		}
 		responses = append(responses, pr)
-		for _, f := range parseFormats(ctx, env, c, pr, jsURL) {
+		fs, d := parseFormats(ctx, env, c, pr, jsURL)
+		diag.skippedCipher += d.skippedCipher
+		diag.sabrOnly += d.sabrOnly
+		if d.playerErr != nil && errors.Is(d.playerErr, ex.ErrPlayerUnsupported) {
+			playerErr = d.playerErr
+		}
+		for _, f := range fs {
 			key := f.FormatID
 			if seen[key] {
 				continue
@@ -154,6 +163,15 @@ func extractVideo(ctx context.Context, env *ex.Env, id string) (*media.Info, err
 	info := buildInfo(id, meta, responses[0])
 	info.Formats = formats
 	if len(formats) == 0 {
+		switch {
+		case playerErr != nil:
+			// base.js скачан, но расшифровать подписи не удалось — плеер изменился.
+			return nil, ex.Wrap(ieKey, id, playerErr, "could not decrypt any format signatures")
+		case diag.skippedCipher > 0:
+			return nil, ex.Errorf(ieKey, id, ex.ErrPlayerUnsupported, "all %d formats had signatures that could not be decrypted (player version unsupported)", diag.skippedCipher)
+		case diag.sabrOnly > 0:
+			return nil, ex.Errorf(ieKey, id, ex.ErrNoFormats, "all formats are SABR-only (streaming protocol not yet supported); a PO Token-capable client is required")
+		}
 		return nil, ex.Errorf(ieKey, id, ex.ErrNoFormats, "no formats found (all formats may require JS player or PO Token)")
 	}
 	info.Subtitles, info.AutomaticCaptions = captions(responses[0], meta)
@@ -209,11 +227,16 @@ func playability(id string, pr any) error {
 	if reason == "" {
 		reason = "video unavailable (" + status + ")"
 	}
+	lower := strings.ToLower(reason)
 	kind := ex.ErrUnavailable
 	switch {
+	case strings.Contains(lower, "not a bot") || strings.Contains(lower, "confirm you’re not a bot") || strings.Contains(lower, "inappropriate for some users"):
+		// «Sign in to confirm you're not a bot» приходит со статусом
+		// LOGIN_REQUIRED, но это бот-проверка, а не требование входа.
+		kind = ex.ErrBotCheck
 	case status == "LOGIN_REQUIRED":
 		kind = ex.ErrLoginRequired
-	case strings.Contains(strings.ToLower(reason), "country"):
+	case strings.Contains(lower, "country") || strings.Contains(lower, "not available in your"):
 		kind = ex.ErrGeoRestricted
 	}
 	return ex.Errorf(ieKey, id, kind, "%s", reason)
@@ -221,9 +244,18 @@ func playability(id string, pr any) error {
 
 var reMimeCodecs = regexp.MustCompile(`^([^;]+);\s*codecs="([^"]*)"`)
 
-func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL string) []*media.Format {
+// formatDiag — почему часть форматов клиента не попала в выдачу. Нужна, чтобы
+// при пустом результате вернуть точную ошибку (плеер устарел / только SABR).
+type formatDiag struct {
+	skippedCipher int   // форматы с подписью, которую не удалось расшифровать
+	sabrOnly      int   // форматы без URL и подписи (доступны только через SABR)
+	playerErr     error // ошибка загрузки/разбора плеера, если расшифровка требовалась
+}
+
+func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL string) ([]*media.Format, formatDiag) {
 	sd := ex.Map(pr, "streamingData")
 	var out []*media.Format
+	var diag formatDiag
 
 	// Плеер нужен только при наличии зашифрованных подписей или n-параметров.
 	// Загружаем лениво и один раз на клиента; кеш в getPlayer общий по URL.
@@ -247,7 +279,6 @@ func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL str
 		return pl
 	}
 
-	skippedCipher, sabrOnly := 0, 0
 	for _, list := range []string{"formats", "adaptiveFormats"} {
 		for _, raw := range ex.Slice(sd, list) {
 			fm, _ := raw.(map[string]any)
@@ -255,12 +286,12 @@ func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL str
 			if u == "" {
 				cipher := ex.FirstStr(fm, ex.P("signatureCipher"), ex.P("cipher"))
 				if cipher == "" {
-					sabrOnly++ // ни URL, ни подписи: формат доступен только через SABR
+					diag.sabrOnly++ // ни URL, ни подписи: формат доступен только через SABR
 					continue
 				}
 				decoded, err := decipherURL(ensurePlayer(), cipher)
 				if err != nil {
-					skippedCipher++
+					diag.skippedCipher++
 					continue
 				}
 				u = decoded
@@ -271,16 +302,17 @@ func parseFormats(ctx context.Context, env *ex.Env, c *Client, pr any, jsURL str
 			}
 		}
 	}
-	if skippedCipher > 0 {
-		env.Warn("youtube: skipped formats whose signature could not be decrypted (this player version may be unsupported)", "client", c.Name, "count", skippedCipher)
+	diag.playerErr = plErr
+	if diag.skippedCipher > 0 {
+		env.Warn("youtube: skipped formats whose signature could not be decrypted (this player version may be unsupported)", "client", c.Name, "count", diag.skippedCipher)
 	}
 	if hlsURL := ex.Str(sd, "hlsManifestUrl"); hlsURL != "" {
 		out = append(out, hlsFormats(ctx, env, c, hlsURL)...)
 	}
-	if sabrOnly > 0 && ex.Str(sd, "serverAbrStreamingUrl") != "" {
-		env.Warn("youtube: client returned SABR-only formats (streaming protocol not supported), skipped", "client", c.Name, "count", sabrOnly)
+	if diag.sabrOnly > 0 && ex.Str(sd, "serverAbrStreamingUrl") != "" {
+		env.Warn("youtube: client returned SABR-only formats (streaming protocol not supported), skipped", "client", c.Name, "count", diag.sabrOnly)
 	}
-	return out
+	return out, diag
 }
 
 // decipherURL разбирает signatureCipher (s, sp, url), расшифровывает подпись
