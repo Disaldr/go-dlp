@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -50,6 +51,8 @@ type Extractor struct {
 	description string
 	priority    int
 	patterns    []*regexp.Regexp
+	hosts       []string // объявленный скриптом allowlist хостов (host.allowed)
+	sandboxed   bool     // источник недоверенный (сетевое обновление)
 
 	file    string
 	program *goja.Program
@@ -69,6 +72,52 @@ func (e *Extractor) Source() string { return e.file }
 
 // Fallback — подменённый встроенный экстрактор (или nil).
 func (e *Extractor) Fallback() ex.Extractor { return e.fallback }
+
+// allowedHosts — allowlist хостов для сендбоксного скрипта: объявленные в
+// скрипте hosts, плюс хосты, извлечённые из match-шаблонов, плюс хост самого
+// извлекаемого URL (его сайт экстрактор обрабатывает по определению).
+func (e *Extractor) allowedHosts(rawURL string) []string {
+	set := map[string]bool{}
+	add := func(h string) {
+		h = strings.ToLower(strings.TrimPrefix(h, "www."))
+		if h != "" {
+			set[h] = true
+		}
+	}
+	for _, h := range e.hosts {
+		add(h)
+	}
+	for _, re := range e.patterns {
+		for _, h := range hostsFromPattern(re.String()) {
+			add(h)
+		}
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		add(u.Hostname())
+	}
+	out := make([]string, 0, len(set))
+	for h := range set {
+		out = append(out, h)
+	}
+	return out
+}
+
+// reHostInPattern вытаскивает литеральный хост из исходника регулярки
+// (часть после http(s)://, с необязательным (?:www\.)? и до первого
+// спецсимвола/разделителя пути).
+var reHostInPattern = regexp.MustCompile(`https?://(?:\(\?:www\\\.\)\?|www\\\.)?([a-zA-Z0-9.\\-]+)`)
+
+func hostsFromPattern(src string) []string {
+	var out []string
+	for _, m := range reHostInPattern.FindAllStringSubmatch(src, -1) {
+		h := strings.ReplaceAll(m[1], `\`, "")
+		h = strings.TrimSuffix(h, ".")
+		if strings.Contains(h, ".") {
+			out = append(out, strings.TrimPrefix(h, "www."))
+		}
+	}
+	return out
+}
 
 func (e *Extractor) match(rawURL string) []string {
 	for _, re := range e.patterns {
@@ -118,7 +167,10 @@ func (e *Extractor) run(ctx context.Context, env *ex.Env, rawURL string, m []str
 
 	vm := goja.New()
 	vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
-	h := &host{ctx: ctx, env: env, vm: vm, ie: e.name}
+	h := &host{ctx: ctx, env: env, vm: vm, ie: e.name, sandboxed: e.sandboxed}
+	if e.sandboxed {
+		h.allowed = e.allowedHosts(rawURL)
+	}
 	h.install()
 	defs := &collector{}
 	vm.Set("extractor", defs.add(vm))
@@ -165,6 +217,7 @@ type definition struct {
 	name, description string
 	priority          int
 	patterns          []*regexp.Regexp
+	hosts             []string
 	extract           goja.Callable
 }
 
@@ -240,6 +293,17 @@ func parseDefinition(vm *goja.Runtime, v goja.Value) (*definition, error) {
 	if len(d.patterns) == 0 {
 		return nil, fmt.Errorf("extractor %q: match is empty", d.name)
 	}
+	// hosts — необязательный allowlist хостов для сетевых запросов скрипта
+	// (сверх хостов из match). Используется только в песочнице.
+	if hv := o.Get("hosts"); hv != nil && !goja.IsUndefined(hv) && !goja.IsNull(hv) {
+		if arr, ok := hv.Export().([]any); ok {
+			for _, h := range arr {
+				if s, ok := h.(string); ok && s != "" {
+					d.hosts = append(d.hosts, s)
+				}
+			}
+		}
+	}
 	return d, nil
 }
 
@@ -279,7 +343,7 @@ func Compile(file, src string) ([]*Extractor, error) {
 	for _, d := range defs.order {
 		out = append(out, &Extractor{
 			name: d.name, description: d.description, priority: d.priority,
-			patterns: d.patterns, file: file, program: prog,
+			patterns: d.patterns, hosts: d.hosts, file: file, program: prog,
 		})
 	}
 	return out, nil

@@ -424,6 +424,10 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
 - Логин по паролю не поддерживается — используйте `--cookies` (Netscape `cookies.txt` или JSON-экспорт
   Cookie-Editor/EditThisCookie) либо `--cookies-from-browser BROWSER[:PROFILE]` (Firefox, Chromium-браузеры
   с расшифровкой средствами ОС, Safari на macOS).
+- JS-экстракторы из сетевых обновлений исполняются в песочнице: нет файловой системы и процессов,
+  `cookie(url, name)` доступен только для доменов экстрактора, и на сторонние хосты cookies не
+  подмешиваются — скрипт не может прочитать и переслать cookies чужого домена. Встроенные и локальные
+  (`--extractor-scripts`) скрипты доверенные. Дополнительные хосты скрипт объявляет полем `hosts: [...]`.
 - Не реализованы: Mixcloud (поток намеренно зашифрован сайтом против скачивания), Rumble и SpankBang
   (Cloudflare блокирует запросы).
 

@@ -43,6 +43,8 @@ func (m *Manager) Install(p *Pack) (bool, error) {
 	}
 	next := map[string]*Extractor{}
 	for _, e := range p.Extractors {
+		// Недоверенный (сетевой) пакет — скрипты в песочнице.
+		e.sandboxed = !p.Trusted
 		k := strings.ToLower(e.name)
 		if _, isScript := m.active[k]; !isScript {
 			if cur, ok := m.reg.Get(e.name); ok {

@@ -15,6 +15,13 @@ package script
 //	base64.encode/decode/decodeURL, hash.md5/sha1/sha256 (hex)
 //	log.debug(msg, ...kv), log.warn(msg, ...kv)
 //	fail.unsupported/unavailable/login/geo/noFormats(msg) — бросить ошибку-категорию
+//
+// Файловой системы и запуска процессов нет. Скрипты из сетевых обновлений
+// исполняются в песочнице (см. host.sandboxed): cookie(url,name) доступен
+// только для доменов экстрактора, и на прочие хосты cookies не подмешиваются
+// (ни из jar, ни из заголовка Cookie) — скрипт не может прочитать и переслать
+// cookies чужого домена. Разрешённые хосты берутся из match-шаблонов, хоста
+// извлекаемого URL и необязательного поля hosts: [...] в определении.
 
 import (
 	"context"
@@ -46,6 +53,54 @@ type host struct {
 	ie      string
 	offline bool // загрузка скрипта: сеть запрещена
 	parse   goja.Callable
+
+	// sandboxed — скрипт из недоверенного источника (сетевое обновление):
+	// cookie() доступен только для доменов из allowed, а на прочие хосты не
+	// подмешиваются cookies (ни из jar, ни из заголовка Cookie). Это не даёт
+	// скрипту прочитать и отправить cookies чужих доменов.
+	sandboxed bool
+	allowed   []string // суффиксы разрешённых хостов (напр. "example.com")
+}
+
+// allowHost сообщает, разрешён ли хост скрипту (точное совпадение или
+// поддомен разрешённого суффикса). Для несендбоксных — всегда да.
+func (h *host) allowHost(host string) bool {
+	if !h.sandboxed {
+		return true
+	}
+	host = strings.ToLower(host)
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	for _, s := range h.allowed {
+		if host == s || strings.HasSuffix(host, "."+s) {
+			return true
+		}
+	}
+	return false
+}
+
+func hostOf(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil {
+		return u.Hostname()
+	}
+	return ""
+}
+
+// scopeCookies для сендбоксного скрипта на запросе к неразрешённому хосту
+// убирает cookies: ставит NoCookies и вычищает заголовок Cookie, чтобы
+// значения cookie своего домена нельзя было переслать на чужой хост.
+func (h *host) scopeCookies(req *ex.Request) {
+	if !h.sandboxed || h.allowHost(hostOf(req.URL)) {
+		return
+	}
+	req.NoCookies = true
+	for k := range req.Headers {
+		if strings.EqualFold(k, "cookie") {
+			delete(req.Headers, k)
+		}
+	}
+	h.env.Debug("sandboxed script: cookies withheld from third-party host", "extractor", h.ie, "host", hostOf(req.URL))
 }
 
 var errOffline = errors.New("network is not available while loading a script (call it inside extract)")
@@ -98,7 +153,13 @@ func (h *host) install() {
 	vm.Set("urlJoin", ex.URLJoin)
 	vm.Set("unescapeHTML", html.UnescapeString)
 	vm.Set("parseDuration", parseDuration)
-	vm.Set("cookie", func(u, name string) string { return h.env.Cookie(u, name) })
+	vm.Set("cookie", func(u, name string) string {
+		if !h.allowHost(hostOf(u)) {
+			h.env.Debug("sandboxed script: cookie read denied for third-party host", "extractor", h.ie, "host", hostOf(u))
+			return ""
+		}
+		return h.env.Cookie(u, name)
+	})
 	vm.Set("arg", func(k, def string) string { return h.env.Arg(h.ie, k, def) })
 
 	b64 := vm.NewObject()
@@ -221,6 +282,7 @@ func (h *host) request(u string, o map[string]any) (goja.Value, error) {
 		}
 	}
 	allowErrors, _ := o["allowErrors"].(bool)
+	h.scopeCookies(&req)
 
 	resp, err := h.env.Fetch(h.ctx, req)
 	var status int
@@ -267,7 +329,9 @@ func (h *host) hls(u string, o map[string]any) (goja.Value, error) {
 		id = "hls"
 	}
 	headers := strMap(o["headers"])
-	r, err := h.env.Fetch(h.ctx, ex.Request{URL: u, Headers: headers})
+	hreq := ex.Request{URL: u, Headers: headers}
+	h.scopeCookies(&hreq)
+	r, err := h.env.Fetch(h.ctx, hreq)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +357,9 @@ func (h *host) dash(u string, o map[string]any) (goja.Value, error) {
 	if id == "" {
 		id = "dash"
 	}
-	r, err := h.env.Fetch(h.ctx, ex.Request{URL: u, Headers: strMap(o["headers"])})
+	dreq := ex.Request{URL: u, Headers: strMap(o["headers"])}
+	h.scopeCookies(&dreq)
+	r, err := h.env.Fetch(h.ctx, dreq)
 	if err != nil {
 		return nil, err
 	}

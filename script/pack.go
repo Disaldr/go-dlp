@@ -32,6 +32,11 @@ type Pack struct {
 	Version    int64
 	HostAPI    int
 	Extractors []*Extractor
+	// Trusted — пакет из доверенного источника (встроенные/локальные скрипты).
+	// Недоверенные (загруженные из сети) исполняются в песочнице: cookie()
+	// доступен только для доменов экстрактора, на чужие хосты cookies не
+	// подмешиваются. См. host.sandboxed.
+	Trusted bool
 	// Raw и Sig — исходные байты (для кеша на диске).
 	Raw, Sig []byte
 }
@@ -140,7 +145,8 @@ func LoadDir(dir fs.FS) (*Pack, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Pack{Version: version, HostAPI: HostAPI, Extractors: exts}, nil
+	// Локальные/встроенные скрипты доверенные — без песочницы.
+	return &Pack{Version: version, HostAPI: HostAPI, Extractors: exts, Trusted: true}, nil
 }
 
 func readDir(dir fs.FS) (map[string]string, int64, error) {
