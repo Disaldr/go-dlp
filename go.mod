@@ -3,7 +3,9 @@ module github.com/Disaldr/go-dlp
 go 1.26.0
 
 require (
+	github.com/abema/go-mp4 v1.7.4
 	github.com/andybalholm/brotli v1.1.1
+	github.com/at-wat/ebml-go v0.19.4
 	github.com/dop251/goja v0.0.0-20261103214539-f5d1d0025744
 	github.com/klauspost/compress v1.17.4
 	github.com/refraction-networking/utls v1.8.2

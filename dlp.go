@@ -78,6 +78,15 @@ type Options struct {
 
 	// FFmpegLocation — путь к ffmpeg или каталогу с ним.
 	FFmpegLocation string
+	// Merger — реализация склейки/ремукса дорожек. Если nil, выбирается
+	// автоматически: внешний ffmpeg (если найден), иначе встроенная склейка
+	// на чистом Go (postprocess.GoMerger). Позволяет подставить свою.
+	Merger postprocess.Merger
+	// PreferFFmpeg — при наличии и ffmpeg, и встроенного муксера
+	// предпочитать ffmpeg (по умолчанию true). Если false и Merger не задан,
+	// используется встроенный Go-муксер, а ffmpeg — только как запасной для
+	// неподдерживаемых им контейнеров (например, ремукс MPEG-TS).
+	PreferFFmpeg *bool
 
 	// NoPlaylist — для ссылок «видео + плейлист» брать только видео.
 	NoPlaylist bool
@@ -100,6 +109,47 @@ type Options struct {
 	Logger *slog.Logger
 }
 
+// Request — параметры одной загрузки, переопределяющие настройки клиента на
+// конкретный вызов (методы *With). Нулевые поля наследуют значения из Options:
+// пустая строка и nil-указатель означают «взять из клиента». Это позволяет
+// одному *Client качать несколько файлов параллельно с разными колбэками
+// прогресса, форматами и каталогами.
+type Request struct {
+	// URL — адрес для извлечения (используется DownloadWith).
+	URL string
+	// Format — выражение выбора форматов на этот вызов.
+	Format string
+	// OutputDir — каталог загрузки на этот вызов.
+	OutputDir string
+	// OutputTemplate — шаблон имени файла на этот вызов.
+	OutputTemplate string
+	// MergeOutputFormat — контейнер для слияния на этот вызов.
+	MergeOutputFormat string
+	// Overwrite — перезаписывать существующие файлы (nil — наследовать).
+	Overwrite *bool
+	// RestrictFilenames — только ASCII без пробелов (nil — наследовать).
+	RestrictFilenames *bool
+	// WriteSubtitles — сохранять субтитры (nil — наследовать).
+	WriteSubtitles *bool
+	// SubtitleLangs — языки субтитров (nil — наследовать).
+	SubtitleLangs []string
+	// Progress — колбэк прогресса именно этой загрузки.
+	Progress downloader.ProgressFunc
+}
+
+// callOpts — эффективные настройки одной загрузки (Options ⊕ Request).
+type callOpts struct {
+	format            string
+	outputDir         string
+	outputTemplate    string
+	mergeOutputFormat string
+	restrictFilenames bool
+	overwrite         bool
+	writeSubtitles    bool
+	subtitleLangs     []string
+	progress          downloader.ProgressFunc
+}
+
 // Client — основной объект библиотеки (аналог YoutubeDL).
 type Client struct {
 	opts    Options
@@ -107,6 +157,7 @@ type Client struct {
 	scripts *script.Manager
 	env     *extractor.Env
 	ffmpeg  *postprocess.FFmpeg
+	merger  postprocess.Merger
 	log     *slog.Logger
 }
 
@@ -208,6 +259,7 @@ func New(opts Options) (*Client, error) {
 	} else if opts.FFmpegLocation != "" {
 		return nil, err
 	}
+	c.merger = c.pickMerger()
 	if opts.Format != "" {
 		if _, err := format.Compile(opts.Format); err != nil {
 			return nil, err
@@ -231,6 +283,29 @@ func (c *Client) Env() *extractor.Env { return c.env }
 
 // HasFFmpeg сообщает, найден ли ffmpeg.
 func (c *Client) HasFFmpeg() bool { return c.ffmpeg != nil }
+
+// Merger возвращает активную реализацию склейки дорожек.
+func (c *Client) Merger() postprocess.Merger { return c.merger }
+
+// pickMerger выбирает реализацию Merger по Options и наличию ffmpeg.
+func (c *Client) pickMerger() postprocess.Merger {
+	if c.opts.Merger != nil {
+		return c.opts.Merger
+	}
+	preferFFmpeg := c.opts.PreferFFmpeg == nil || *c.opts.PreferFFmpeg
+	goMux := postprocess.NewGoMerger()
+	switch {
+	case c.ffmpeg != nil && preferFFmpeg:
+		return c.ffmpeg
+	case c.ffmpeg != nil:
+		// Встроенный муксер первичен, ffmpeg — запасной для контейнеров,
+		// которые Go-муксер не поддерживает (например, ремукс MPEG-TS).
+		goMux.Fallback = c.ffmpeg
+		return goMux
+	default:
+		return goMux
+	}
+}
 
 // maxURLDepth ограничивает цепочку KindURL-переходов.
 const maxURLDepth = 8
@@ -402,12 +477,62 @@ func (c *Client) Walk(ctx context.Context, info *media.Info, fn func(entry *medi
 	return nil
 }
 
-// DefaultFormat — выражение формата по умолчанию для клиента.
-func (c *Client) DefaultFormat() string {
-	if c.opts.Format != "" {
-		return c.opts.Format
+// defaults — настройки загрузки из Options клиента.
+func (c *Client) defaults() callOpts {
+	return callOpts{
+		format:            c.opts.Format,
+		outputDir:         c.opts.OutputDir,
+		outputTemplate:    c.opts.OutputTemplate,
+		mergeOutputFormat: c.opts.MergeOutputFormat,
+		restrictFilenames: c.opts.RestrictFilenames,
+		overwrite:         c.opts.Overwrite,
+		writeSubtitles:    c.opts.WriteSubtitles,
+		subtitleLangs:     c.opts.SubtitleLangs,
+		progress:          c.opts.Progress,
 	}
-	if c.ffmpeg != nil {
+}
+
+// resolve накладывает непустые поля Request на настройки клиента.
+func (c *Client) resolve(req Request) callOpts {
+	co := c.defaults()
+	if req.Format != "" {
+		co.format = req.Format
+	}
+	if req.OutputDir != "" {
+		co.outputDir = req.OutputDir
+	}
+	if req.OutputTemplate != "" {
+		co.outputTemplate = req.OutputTemplate
+	}
+	if req.MergeOutputFormat != "" {
+		co.mergeOutputFormat = req.MergeOutputFormat
+	}
+	if req.RestrictFilenames != nil {
+		co.restrictFilenames = *req.RestrictFilenames
+	}
+	if req.Overwrite != nil {
+		co.overwrite = *req.Overwrite
+	}
+	if req.WriteSubtitles != nil {
+		co.writeSubtitles = *req.WriteSubtitles
+	}
+	if req.SubtitleLangs != nil {
+		co.subtitleLangs = req.SubtitleLangs
+	}
+	if req.Progress != nil {
+		co.progress = req.Progress
+	}
+	return co
+}
+
+// DefaultFormat — выражение формата по умолчанию для клиента.
+func (c *Client) DefaultFormat() string { return c.defaultFormat(c.defaults()) }
+
+func (c *Client) defaultFormat(co callOpts) string {
+	if co.format != "" {
+		return co.format
+	}
+	if c.merger != nil {
 		return "bv*+ba/b"
 	}
 	return "b/bv*+ba"
@@ -415,8 +540,12 @@ func (c *Client) DefaultFormat() string {
 
 // SelectFormats выбирает форматы по Options.Format (или переданному spec).
 func (c *Client) SelectFormats(info *media.Info, spec string) ([]format.Selection, error) {
+	return c.selectFormats(info, spec, c.defaults())
+}
+
+func (c *Client) selectFormats(info *media.Info, spec string, co callOpts) ([]format.Selection, error) {
 	if spec == "" {
-		spec = c.DefaultFormat()
+		spec = c.defaultFormat(co)
 	}
 	sel, err := format.Compile(spec)
 	if err != nil {
@@ -429,10 +558,10 @@ func (c *Client) SelectFormats(info *media.Info, spec string) ([]format.Selectio
 	if err != nil {
 		return nil, err
 	}
-	if c.ffmpeg == nil {
+	if c.merger == nil {
 		for _, s := range sels {
 			if len(s) > 1 {
-				return nil, fmt.Errorf("format %s requires merging, but ffmpeg is not installed", s.ID())
+				return nil, fmt.Errorf("format %s requires merging, but no merger is available", s.ID())
 			}
 		}
 	}
@@ -442,7 +571,16 @@ func (c *Client) SelectFormats(info *media.Info, spec string) ([]format.Selectio
 // Prepare заполняет выбранные форматы, расширение и имя файла (без загрузки).
 // Возвращает по копии Info на каждую выборку.
 func (c *Client) Prepare(info *media.Info) ([]*media.Info, error) {
-	sels, err := c.SelectFormats(info, "")
+	return c.prepare(info, c.defaults())
+}
+
+// PrepareWith — как Prepare, но с переопределениями из req.
+func (c *Client) PrepareWith(info *media.Info, req Request) ([]*media.Info, error) {
+	return c.prepare(info, c.resolve(req))
+}
+
+func (c *Client) prepare(info *media.Info, co callOpts) ([]*media.Info, error) {
+	sels, err := c.selectFormats(info, co.format, co)
 	if err != nil {
 		return nil, err
 	}
@@ -452,11 +590,11 @@ func (c *Client) Prepare(info *media.Info) ([]*media.Info, error) {
 		cp.RequestedFormats = s
 		cp.FormatID = s.ID()
 		if len(s) > 1 {
-			cp.Ext = postprocess.MergeExt(s, c.opts.MergeOutputFormat)
+			cp.Ext = postprocess.MergeExt(s, co.mergeOutputFormat)
 		} else {
 			cp.Ext = s[0].Ext
 		}
-		cp.Filename = outtmpl.Filename(c.opts.OutputDir, c.opts.OutputTemplate, &cp, c.opts.RestrictFilenames)
+		cp.Filename = outtmpl.Filename(co.outputDir, co.outputTemplate, &cp, co.restrictFilenames)
 		out = append(out, &cp)
 	}
 	return out, nil
@@ -479,18 +617,38 @@ func (c *Client) Download(ctx context.Context, rawURL string) ([]Result, error) 
 	if err != nil {
 		return nil, err
 	}
-	return c.DownloadInfo(ctx, info)
+	return c.downloadInfo(ctx, info, c.defaults())
+}
+
+// DownloadWith извлекает req.URL и скачивает его с переопределениями из req
+// (свой колбэк прогресса, формат, каталог) — для параллельных загрузок одним
+// клиентом.
+func (c *Client) DownloadWith(ctx context.Context, req Request) ([]Result, error) {
+	info, err := c.Extract(ctx, req.URL)
+	if err != nil {
+		return nil, err
+	}
+	return c.downloadInfo(ctx, info, c.resolve(req))
 }
 
 // DownloadInfo скачивает уже извлечённую информацию.
 func (c *Client) DownloadInfo(ctx context.Context, info *media.Info) ([]Result, error) {
+	return c.downloadInfo(ctx, info, c.defaults())
+}
+
+// DownloadInfoWith — как DownloadInfo, но с переопределениями из req.
+func (c *Client) DownloadInfoWith(ctx context.Context, info *media.Info, req Request) ([]Result, error) {
+	return c.downloadInfo(ctx, info, c.resolve(req))
+}
+
+func (c *Client) downloadInfo(ctx context.Context, info *media.Info, co callOpts) ([]Result, error) {
 	var results []Result
 	err := c.Walk(ctx, info, func(e *media.Info, err error) error {
 		if err != nil {
 			results = append(results, Result{Err: err})
 			return nil
 		}
-		rs, err := c.DownloadVideo(ctx, e)
+		rs, err := c.downloadVideo(ctx, e, co)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -506,21 +664,30 @@ func (c *Client) DownloadInfo(ctx context.Context, info *media.Info) ([]Result, 
 
 // DownloadVideo скачивает одно видео (может дать несколько файлов при spec через ',').
 func (c *Client) DownloadVideo(ctx context.Context, info *media.Info) ([]Result, error) {
-	prepared, err := c.Prepare(info)
+	return c.downloadVideo(ctx, info, c.defaults())
+}
+
+// DownloadVideoWith — как DownloadVideo, но с переопределениями из req.
+func (c *Client) DownloadVideoWith(ctx context.Context, info *media.Info, req Request) ([]Result, error) {
+	return c.downloadVideo(ctx, info, c.resolve(req))
+}
+
+func (c *Client) downloadVideo(ctx context.Context, info *media.Info, co callOpts) ([]Result, error) {
+	prepared, err := c.prepare(info, co)
 	if err != nil {
 		return nil, err
 	}
 	var results []Result
 	for _, p := range prepared {
 		r := Result{Info: p, Filename: p.Filename}
-		if !c.opts.Overwrite && exists(p.Filename) {
+		if !co.overwrite && exists(p.Filename) {
 			r.Skipped = true
 			c.log.Info("already downloaded", "file", p.Filename)
 		} else {
-			r.Err = c.downloadPrepared(ctx, p)
+			r.Err = c.downloadPrepared(ctx, p, co)
 		}
-		if r.Err == nil && c.opts.WriteSubtitles {
-			if err := c.writeSubtitles(ctx, p); err != nil {
+		if r.Err == nil && co.writeSubtitles {
+			if err := c.writeSubtitles(ctx, p, co); err != nil {
 				c.log.Warn("subtitles", "err", err)
 			}
 		}
@@ -549,19 +716,19 @@ func isLive(info *media.Info) bool {
 	return false
 }
 
-func (c *Client) dlOptions() downloader.Options {
+func (c *Client) dlOptions(co callOpts) downloader.Options {
 	return downloader.Options{
 		HTTP:      c.env.HTTP,
 		UserAgent: c.env.UserAgent,
 		Retries:   c.opts.Retries,
 		Fragments: c.opts.Fragments,
 		ChunkSize: c.opts.ChunkSize,
-		Progress:  c.opts.Progress,
+		Progress:  co.progress,
 		RateLimit: c.opts.RateLimit,
 	}
 }
 
-func (c *Client) downloadPrepared(ctx context.Context, info *media.Info) error {
+func (c *Client) downloadPrepared(ctx context.Context, info *media.Info, co callOpts) error {
 	if dir := filepath.Dir(info.Filename); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
@@ -574,7 +741,7 @@ func (c *Client) downloadPrepared(ctx context.Context, info *media.Info) error {
 		ppCtx = context.WithoutCancel(ctx)
 	}
 	if len(formats) == 1 {
-		return c.downloadOne(ctx, ppCtx, info, formats[0], info.Filename, true)
+		return c.downloadOne(ctx, ppCtx, info, formats[0], info.Filename, true, co)
 	}
 	base := strings.TrimSuffix(info.Filename, filepath.Ext(info.Filename))
 	inputs := make([]postprocess.Input, len(formats))
@@ -589,7 +756,7 @@ func (c *Client) downloadPrepared(ctx context.Context, info *media.Info) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				errs[i] = c.downloadOne(ctx, ppCtx, info, f, inputs[i].Path, false)
+				errs[i] = c.downloadOne(ctx, ppCtx, info, f, inputs[i].Path, false, co)
 			}()
 		}
 		wg.Wait()
@@ -598,14 +765,14 @@ func (c *Client) downloadPrepared(ctx context.Context, info *media.Info) error {
 		}
 	} else {
 		for i, f := range formats {
-			if err := c.downloadOne(ctx, ppCtx, info, f, inputs[i].Path, false); err != nil {
+			if err := c.downloadOne(ctx, ppCtx, info, f, inputs[i].Path, false, co); err != nil {
 				return err
 			}
 		}
 	}
 	c.log.Info("merging formats", "file", info.Filename)
 	tmp := info.Filename + ".temp" + filepath.Ext(info.Filename)
-	if err := c.ffmpeg.Merge(ppCtx, tmp, inputs); err != nil {
+	if err := c.merger.Merge(ppCtx, tmp, inputs); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, info.Filename); err != nil {
@@ -619,8 +786,8 @@ func (c *Client) downloadPrepared(ctx context.Context, info *media.Info) error {
 
 // downloadOne качает формат; для HLS при необходимости делает ремукс TS → контейнер.
 // ppCtx — контекст постобработки (для эфира не отменяется вместе с записью).
-func (c *Client) downloadOne(ctx, ppCtx context.Context, info *media.Info, f *media.Format, dst string, final bool) error {
-	opts := c.dlOptions()
+func (c *Client) downloadOne(ctx, ppCtx context.Context, info *media.Info, f *media.Format, dst string, final bool, co callOpts) error {
+	opts := c.dlOptions(co)
 	if target := c.env.ImpersonateTarget(f.Impersonate); target != "" {
 		hc, err := c.env.ClientFor(target)
 		if err != nil {
@@ -641,23 +808,24 @@ func (c *Client) downloadOne(ctx, ppCtx context.Context, info *media.Info, f *me
 	if err := d.Download(ctx, f, headers, tsPath); err != nil {
 		return err
 	}
-	if c.ffmpeg == nil {
-		if final {
-			c.log.Warn("ffmpeg not found; HLS stream saved as MPEG-TS", "file", dst)
+	if err := c.merger.Remux(ppCtx, tsPath, dst); err != nil {
+		if errors.Is(err, postprocess.ErrUnsupportedMux) {
+			// Муксер не умеет ремуксить MPEG-TS — сохраняем поток как .ts.
+			if final {
+				c.log.Warn("no TS-capable merger; HLS stream saved as MPEG-TS", "file", dst)
+			}
+			return os.Rename(tsPath, dst)
 		}
-		return os.Rename(tsPath, dst)
-	}
-	if err := c.ffmpeg.Remux(ppCtx, tsPath, dst); err != nil {
 		return err
 	}
 	return os.Remove(tsPath)
 }
 
-func (c *Client) writeSubtitles(ctx context.Context, info *media.Info) error {
+func (c *Client) writeSubtitles(ctx context.Context, info *media.Info, co callOpts) error {
 	base := strings.TrimSuffix(info.Filename, filepath.Ext(info.Filename))
 	var errs []error
 	for lang, tracks := range info.Subtitles {
-		if !wantLang(c.opts.SubtitleLangs, lang) || len(tracks) == 0 {
+		if !wantLang(co.subtitleLangs, lang) || len(tracks) == 0 {
 			continue
 		}
 		t := tracks[0]

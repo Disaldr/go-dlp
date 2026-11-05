@@ -2,7 +2,7 @@
 
 Загрузчик видео и аудио на Go — библиотека и CLI. Порт ключевой функциональности
 [yt-dlp](https://github.com/yt-dlp/yt-dlp): экстракторы сайтов, язык выбора форматов,
-HLS/DASH, слияние дорожек через ffmpeg, шаблоны имён файлов.
+HLS/DASH, слияние дорожек (ffmpeg **или** встроенный муксер на чистом Go), шаблоны имён файлов.
 
 - **Библиотека в первую очередь**: всё, что умеет CLI, доступно из Go-кода.
 - **Реактивный реестр экстракторов**: экстракторы можно добавлять, заменять и удалять на лету через канал.
@@ -17,8 +17,10 @@ go install github.com/Disaldr/go-dlp/cmd/go-dlp@latest
 git clone https://github.com/Disaldr/go-dlp && cd go-dlp && go build -o bin/go-dlp ./cmd/go-dlp
 ```
 
-Требуется Go 1.26+. Для слияния видео и аудио и перепаковки HLS нужен [ffmpeg](https://ffmpeg.org/) в `PATH`
-(или `--ffmpeg-location`).
+Требуется Go 1.26+. Слияние видео и аудио работает **без ffmpeg**: встроенный муксер на чистом Go
+собирает MP4 (прогрессивный и фрагментированный) и WebM/MKV копированием дорожек, без перекодирования.
+ffmpeg нужен лишь для перепаковки HLS (MPEG-TS → mp4) и как запасной муксер для нестандартных кодеков;
+если он есть в `PATH` (или задан `--ffmpeg-location`), по умолчанию используется он.
 
 ## CLI
 
@@ -128,6 +130,62 @@ fmt.Println(<-events)
 
 Полный пример — [`example_test.go`](example_test.go).
 
+### Параметры на каждый вызов
+
+Один `*Client` можно использовать для параллельных загрузок с разными колбэками
+прогресса, форматами и каталогами — через `Request` и методы `*With` (нулевые поля
+наследуются из `Options`):
+
+```go
+var wg sync.WaitGroup
+for _, u := range urls {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		client.DownloadWith(ctx, dlp.Request{
+			URL:       u,
+			Format:    "bv*+ba/b",
+			OutputDir: filepath.Join("out", host(u)),
+			Progress:  func(p downloader.Progress) { report(u, p) },
+		})
+	}()
+}
+wg.Wait()
+```
+
+Есть и `DownloadInfoWith` / `DownloadVideoWith` / `PrepareWith` для уже извлечённой `*media.Info`.
+
+### Слияние без ffmpeg и свой муксер
+
+Склейка дорожек описана интерфейсом `postprocess.Merger`; реализация выбирается
+автоматически (внешний ffmpeg, если найден, иначе встроенный `GoMerger` на чистом Go).
+Поведение настраивается:
+
+```go
+// Предпочесть встроенный Go-муксер, ffmpeg — только запасной для TS и т.п.:
+client, _ := dlp.New(dlp.Options{PreferFFmpeg: new(bool)}) // *bool = false
+
+// Или подставить свою реализацию:
+client, _ := dlp.New(dlp.Options{Merger: myMerger}) // myMerger удовлетворяет postprocess.Merger
+```
+
+### Типы ошибок
+
+Ошибки экстракции — категории для `errors.Is`: `extractor.ErrUnsupportedURL`,
+`ErrLoginRequired`, `ErrGeoRestricted`, `ErrBotCheck` (проверка «вы не робот»),
+`ErrPlayerUnsupported` (изменился плеер сайта — экстрактор пора обновить),
+`ErrUnavailable`, `ErrNoFormats`:
+
+```go
+_, err := client.Download(ctx, url)
+switch {
+case errors.Is(err, extractor.ErrBotCheck):
+	// нужны cookies браузера или PO Token
+case errors.Is(err, extractor.ErrLoginRequired):
+	// приватное/с возрастным ограничением — передайте --cookies
+}
+```
+
 ## Поддерживаемые сайты
 
 | Сайт | Экстракторы |
@@ -180,7 +238,7 @@ fmt.Println(<-events)
 | `downloader` | HTTP (докачка, Range-чанки), HLS (AES-128, live), DASH-фрагменты (live) | `downloader/` |
 | `hls`, `dash` | парсеры m3u8 и MPD | `_parse_m3u8_formats`, `_parse_mpd_formats` |
 | `impersonate` | имитация браузера (uTLS + HTTP/2-отпечаток) | `networking/_curlcffi.py` |
-| `postprocess` | ffmpeg: слияние, ремукс | `postprocessor/` |
+| `postprocess` | слияние/ремукс дорожек: `Merger` (ffmpeg или `GoMerger` на чистом Go — MP4/WebM/MKV) | `postprocessor/` |
 | `outtmpl` | шаблоны имён файлов | `prepare_outtmpl` |
 | `cmd/go-dlp`, `internal/cli` | CLI на cobra | `options.py` |
 
@@ -338,7 +396,9 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
   с шифрованными форматами включаются через `--extractor-args youtube:player_client=web` (или `tv`).
   Клиент `web` работает в гостевом режиме (без visitor data), но YouTube сейчас отдаёт ему
   почти все форматы только через SABR (`serverAbrStreamingUrl`, без `url`/`signatureCipher`);
-  SABR не поддерживается, такие форматы пропускаются с предупреждением. PO Token не
+  SABR не поддерживается, такие форматы пропускаются с предупреждением (а если форматов не
+  осталось вовсе — возвращается понятная ошибка; при неразбираемом base.js — `ErrPlayerUnsupported`).
+  PO Token не
   поддерживается, клиент `tv` возвращает UNPLAYABLE, поэтому `web`/`tv` не включены по умолчанию.
   Если `visionos` не дал форматов (например, «Sign in to confirm you're not a bot»),
   автоматически пробуется `tv_simply`: подписи и n расшифровываются в goja, PO Token не нужен.
