@@ -14,13 +14,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Disaldr/go-dlp/downloader"
 	"github.com/Disaldr/go-dlp/extractor"
@@ -34,7 +37,7 @@ import (
 )
 
 // Version — версия библиотеки.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // Options — настройки клиента. Нулевое значение пригодно к использованию.
 type Options struct {
@@ -46,8 +49,15 @@ type Options struct {
 	OutputDir string
 	// RestrictFilenames — только ASCII и без пробелов.
 	RestrictFilenames bool
+	// WindowsFilenames — исключать зарезервированные имена и завершающие точки.
+	WindowsFilenames bool
 	// MergeOutputFormat — контейнер для слияния (mp4, mkv, webm...).
 	MergeOutputFormat string
+	// ExtractAudio — оставить только аудио, AudioFormat — best, mp3, m4a, opus и т.п.
+	ExtractAudio bool
+	AudioFormat  string
+	// RemuxVideo — перепаковать результат в этот контейнер без перекодирования.
+	RemuxVideo string
 	// Overwrite — перезаписывать существующие файлы.
 	Overwrite bool
 
@@ -63,8 +73,12 @@ type Options struct {
 	ExtractorArgs map[string]map[string][]string
 
 	HTTPClient *http.Client
-	Proxy      string
-	UserAgent  string
+	// SocketTimeout — максимальное ожидание заголовков или очередного чтения.
+	SocketTimeout time.Duration
+	// ExtractorRetries — число повторов экстракции при временных сетевых ошибках.
+	ExtractorRetries int
+	Proxy            string
+	UserAgent        string
 	// CookiesFile — файл cookies: Netscape cookies.txt (как --cookies в yt-dlp)
 	// или JSON-экспорт расширения браузера (Cookie-Editor, EditThisCookie).
 	CookiesFile string
@@ -134,6 +148,14 @@ type Request struct {
 	OutputTemplate string
 	// MergeOutputFormat — контейнер для слияния на этот вызов.
 	MergeOutputFormat string
+	// ExtractAudio — извлекать аудио (nil — наследовать).
+	ExtractAudio *bool
+	// AudioFormat — формат извлечённого аудио (пусто — наследовать).
+	AudioFormat string
+	// RemuxVideo — контейнер результата (пусто — наследовать).
+	RemuxVideo string
+	// WindowsFilenames — имена, совместимые с Windows (nil — наследовать).
+	WindowsFilenames *bool
 	// Overwrite — перезаписывать существующие файлы (nil — наследовать).
 	Overwrite *bool
 	// RestrictFilenames — только ASCII без пробелов (nil — наследовать).
@@ -153,6 +175,10 @@ type callOpts struct {
 	outputTemplate    string
 	mergeOutputFormat string
 	restrictFilenames bool
+	windowsFilenames  bool
+	extractAudio      bool
+	audioFormat       string
+	remuxVideo        string
 	overwrite         bool
 	writeSubtitles    bool
 	subtitleLangs     []string
@@ -172,6 +198,14 @@ type Client struct {
 
 // New создаёт клиента.
 func New(opts Options) (*Client, error) {
+	if opts.ExtractAudio {
+		if err := postprocess.ValidateAudioFormat(opts.AudioFormat); err != nil {
+			return nil, err
+		}
+	}
+	if err := postprocess.ValidateRemuxFormat(opts.RemuxVideo); err != nil {
+		return nil, err
+	}
 	c := &Client{opts: opts, reg: opts.Registry, log: opts.Logger}
 	if c.reg == nil {
 		c.reg = all.Registry()
@@ -212,6 +246,7 @@ func New(opts Options) (*Client, error) {
 		}
 		hc = extractor.DefaultHTTPClient(proxy)
 	}
+	hc = extractor.WithSocketTimeout(hc, opts.SocketTimeout)
 	ua := opts.UserAgent
 	if ua == "" {
 		ua = extractor.DefaultUserAgent
@@ -250,9 +285,10 @@ func New(opts Options) (*Client, error) {
 	c.env = &extractor.Env{
 		HTTP: hc, UserAgent: ua, Logger: c.log, Registry: c.reg,
 		Args: args, NoPlaylist: opts.NoPlaylist, MaxEntries: opts.PlaylistEnd,
-		Impersonate:  imp,
-		Impersonator: &impersonate.Pool{Jar: hc.Jar, Proxy: proxyFn},
-		Creds:        creds,
+		Impersonate:   imp,
+		Impersonator:  &impersonate.Pool{Jar: hc.Jar, Proxy: proxyFn},
+		Creds:         creds,
+		SocketTimeout: opts.SocketTimeout,
 	}
 	if opts.CookiesFromBrowser != "" {
 		n, err := extractor.LoadCookiesFromBrowser(hc, opts.CookiesFromBrowser)
@@ -368,7 +404,7 @@ func (c *Client) extract(ctx context.Context, rawURL, ieKey string, depth int) (
 		ie = e
 	}
 	c.log.Debug("extracting", "extractor", ie.Name(), "url", rawURL)
-	info, err := ie.Extract(ctx, c.env, rawURL)
+	info, err := c.extractRetry(ctx, ie, rawURL)
 	// экстрактор может отказаться от URL уже после проверки (например, PeerTube
 	// узнаёт инстанс только запросом к API) — тогда пробуем следующие по очереди
 	for tried := []string{ie.Name()}; err != nil && errors.Is(err, extractor.ErrUnsupportedURL); {
@@ -379,7 +415,7 @@ func (c *Client) extract(ctx context.Context, rawURL, ieKey string, depth int) (
 		tried = append(tried, next.Name())
 		c.log.Debug("extractor declined URL, trying next", "declined", ie.Name(), "next", next.Name())
 		ie = next
-		info, err = ie.Extract(ctx, c.env, rawURL)
+		info, err = c.extractRetry(ctx, ie, rawURL)
 	}
 	if err != nil {
 		return nil, err
@@ -397,6 +433,27 @@ func (c *Client) extract(ctx context.Context, rawURL, ieKey string, depth int) (
 	}
 	c.normalize(info, ie.Name(), rawURL)
 	return info, nil
+}
+
+func (c *Client) extractRetry(ctx context.Context, ie extractor.Extractor, rawURL string) (*media.Info, error) {
+	for attempt := 0; ; attempt++ {
+		info, err := ie.Extract(ctx, c.env, rawURL)
+		var he *extractor.HTTPError
+		var ne net.Error
+		retry := errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &ne) ||
+			(errors.As(err, &he) && (he.StatusCode == 429 || he.StatusCode >= 500))
+		if err == nil || !retry || ctx.Err() != nil || attempt >= c.opts.ExtractorRetries {
+			return info, err
+		}
+		c.log.Debug("retrying extraction", "extractor", ie.Name(), "attempt", attempt+1, "err", err)
+		timer := time.NewTimer(time.Duration(1<<min(attempt, 4)) * 250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // mergeMissing переносит метаданные из ссылки (например, названия из плейлиста),
@@ -519,6 +576,10 @@ func (c *Client) defaults() callOpts {
 		outputTemplate:    c.opts.OutputTemplate,
 		mergeOutputFormat: c.opts.MergeOutputFormat,
 		restrictFilenames: c.opts.RestrictFilenames,
+		windowsFilenames:  c.opts.WindowsFilenames,
+		extractAudio:      c.opts.ExtractAudio,
+		audioFormat:       c.opts.AudioFormat,
+		remuxVideo:        c.opts.RemuxVideo,
 		overwrite:         c.opts.Overwrite,
 		writeSubtitles:    c.opts.WriteSubtitles,
 		subtitleLangs:     c.opts.SubtitleLangs,
@@ -544,6 +605,18 @@ func (c *Client) resolve(req Request) callOpts {
 	if req.RestrictFilenames != nil {
 		co.restrictFilenames = *req.RestrictFilenames
 	}
+	if req.WindowsFilenames != nil {
+		co.windowsFilenames = *req.WindowsFilenames
+	}
+	if req.ExtractAudio != nil {
+		co.extractAudio = *req.ExtractAudio
+	}
+	if req.AudioFormat != "" {
+		co.audioFormat = req.AudioFormat
+	}
+	if req.RemuxVideo != "" {
+		co.remuxVideo = req.RemuxVideo
+	}
 	if req.Overwrite != nil {
 		co.overwrite = *req.Overwrite
 	}
@@ -565,6 +638,9 @@ func (c *Client) DefaultFormat() string { return c.defaultFormat(c.defaults()) }
 func (c *Client) defaultFormat(co callOpts) string {
 	if co.format != "" {
 		return co.format
+	}
+	if co.extractAudio {
+		return "ba/b"
 	}
 	if c.merger == nil {
 		return "b/bv*+ba"
@@ -619,6 +695,14 @@ func (c *Client) PrepareWith(info *media.Info, req Request) ([]*media.Info, erro
 }
 
 func (c *Client) prepare(info *media.Info, co callOpts) ([]*media.Info, error) {
+	if co.extractAudio {
+		if err := postprocess.ValidateAudioFormat(co.audioFormat); err != nil {
+			return nil, err
+		}
+	}
+	if err := postprocess.ValidateRemuxFormat(co.remuxVideo); err != nil {
+		return nil, err
+	}
 	sels, err := c.selectFormats(info, co.format, co)
 	if err != nil {
 		return nil, err
@@ -633,7 +717,7 @@ func (c *Client) prepare(info *media.Info, co callOpts) ([]*media.Info, error) {
 		} else {
 			cp.Ext = s[0].Ext
 		}
-		cp.Filename = outtmpl.Filename(co.outputDir, co.outputTemplate, &cp, co.restrictFilenames)
+		cp.Filename = outtmpl.FilenameWithWindows(co.outputDir, co.outputTemplate, &cp, co.restrictFilenames, co.windowsFilenames)
 		out = append(out, &cp)
 	}
 	return out, nil
@@ -795,12 +879,26 @@ func (c *Client) downloadVideo(ctx context.Context, info *media.Info, co callOpt
 	var results []Result
 	for _, p := range prepared {
 		r := Result{Info: p, Filename: p.Filename}
-		if !co.overwrite && exists(p.Filename) {
+		targetExt := c.outputExt(p, co)
+		target := replaceExt(p.Filename, p.Ext, targetExt)
+		if !co.overwrite && exists(target) {
 			r.Skipped = true
-			c.log.Info("already downloaded", "file", p.Filename)
+			p.Filename, p.Ext = target, targetExt
+			c.log.Info("already downloaded", "file", target)
 		} else {
-			r.Err = c.downloadPrepared(ctx, p, co)
+			// Повторно используем исходник, оставшийся после ошибки постобработки.
+			if co.overwrite || !exists(p.Filename) {
+				r.Err = c.downloadPrepared(ctx, p, co)
+			}
+			if r.Err == nil {
+				ppCtx := ctx
+				if isLive(p) {
+					ppCtx = context.WithoutCancel(ctx)
+				}
+				r.Err = c.postprocess(ppCtx, p, co)
+			}
 		}
+		r.Filename = p.Filename
 		if r.Err == nil && co.writeSubtitles {
 			if err := c.writeSubtitles(ctx, p, co); err != nil {
 				c.log.Warn("subtitles", "err", err)

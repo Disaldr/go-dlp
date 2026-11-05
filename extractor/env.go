@@ -25,9 +25,10 @@ const MaxBodySize = 64 << 20
 
 // Env — окружение, передаваемое экстракторам: HTTP, настройки, логгер.
 type Env struct {
-	HTTP      *http.Client
-	UserAgent string
-	Logger    *slog.Logger
+	HTTP          *http.Client
+	SocketTimeout time.Duration
+	UserAgent     string
+	Logger        *slog.Logger
 	// Registry — реестр, в котором зарегистрирован экстрактор (для поиска встраиваний).
 	Registry *Registry
 	// Args — аргументы экстракторов: ie -> ключ -> значения (как --extractor-args).
@@ -61,7 +62,11 @@ func (e *Env) ClientFor(target string) (*http.Client, error) {
 		}
 		e.Impersonator = &impersonate.Pool{Jar: jar}
 	}
-	return e.Impersonator.Client(target)
+	client, err := e.Impersonator.Client(target)
+	if err != nil {
+		return nil, err
+	}
+	return WithSocketTimeout(client, e.SocketTimeout), nil
 }
 
 // ImpersonateTarget — фактическая цель для запроса: явная или глобальная.

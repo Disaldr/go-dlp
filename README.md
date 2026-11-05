@@ -12,6 +12,8 @@ HLS/DASH, слияние дорожек (ffmpeg **или** встроенный 
 
 ## Установка
 
+Готовые бинарники для macOS, Linux и Windows: [GitHub Releases](https://github.com/Disaldr/go-dlp/releases/latest).
+
 ```sh
 go install github.com/Disaldr/go-dlp/cmd/go-dlp@latest
 # или из исходников
@@ -20,7 +22,8 @@ git clone https://github.com/Disaldr/go-dlp && cd go-dlp && go build -o bin/go-d
 
 Требуется Go 1.26+. Слияние видео и аудио работает **без ffmpeg**: встроенный муксер на чистом Go
 собирает MP4 (прогрессивный и фрагментированный) и WebM/MKV копированием дорожек, без перекодирования.
-ffmpeg нужен лишь для перепаковки HLS (MPEG-TS → mp4) и как запасной муксер для нестандартных кодеков;
+ffmpeg нужен для извлечения/конвертации аудио (`-x`), перепаковки HLS (MPEG-TS → mp4)
+и как запасной муксер для нестандартных кодеков; для `-x` также нужен ffprobe;
 если он есть в `PATH` (или задан `--ffmpeg-location`), по умолчанию используется он.
 
 ## CLI
@@ -31,7 +34,10 @@ go-dlp https://youtu.be/jNQXAC9IVRw                  # скачать лучше
 go-dlp -f "bv*[height<=720]+ba/b" URL                # выбор форматов, как в yt-dlp
 go-dlp -o "%(uploader)s/%(title)s.%(ext)s" URL       # шаблон имени файла
 go-dlp -j URL | jq .title                            # JSON без загрузки
+go-dlp -x --audio-format mp3 URL                    # извлечь аудио через ffmpeg
+go-dlp --remux-video mkv URL                        # перепаковать и одиночный формат, и результат слияния
 go-dlp --playlist-end 5 -e "ytsearch10:golang"       # поиск, первые 5 названий
+go-dlp -M 4 URL1 URL2 PLAYLIST_URL                   # 4 параллельные загрузки (URL и элементы плейлиста)
 go-dlp --cookies cookies.txt URL                     # cookies: Netscape cookies.txt или JSON-экспорт
 go-dlp --impersonate chrome URL                      # имитация браузера
 go-dlp extractors                                    # список экстракторов
@@ -40,6 +46,49 @@ go-dlp --help                                        # все флаги
 
 Прямые эфиры (HLS/DASH) записываются с live-края; `Ctrl+C` останавливает запись, скачанное сохраняется
 и сливается. Повторный `Ctrl+C` — немедленный выход.
+
+`-M, --concurrent-downloads N` качает до `N` видео одновременно пулом горутин — параллелятся и
+отдельные URL из командной строки, и элементы одного плейлиста. Не путать с `-N,
+--concurrent-fragments` (параллельные HLS/DASH-фрагменты **внутри одного** видео): их можно
+сочетать. При `-M > 1` единая строка прогресса отключается (она рассчитана на одну активную
+загрузку) — остаются построчные сообщения по каждому видео. Режимы вывода и симуляции (`-j`, `-F`,
+`-g`, `-s` и т. п.) всегда последовательны. Пользовательский `--progress-template`
+продолжает выводить отдельные строки и при параллельной загрузке.
+
+Для приложений, запускающих загрузчик как процесс, поддерживаются аргументы заданий GLIGO:
+
+```sh
+go-dlp --ignore-config --no-playlist --newline --progress --no-colors --encoding utf-8 \
+  -f 'bestvideo+bestaudio/best' -P downloads -o '%(title).180B [%(id)s].%(ext)s' \
+  --windows-filenames --merge-output-format mkv --remux-video mkv \
+  --print 'after_move:GLIGO_FILE:%(filepath)s' \
+  --progress-template 'download:GLIGO_PROGRESS:%(progress)j' -- URL
+```
+
+Шаблон прогресса выводится в **stdout** отдельными строками. `progress` содержит
+`status`, `downloaded_bytes`, `total_bytes`, `total_bytes_estimate`, `speed`, `eta`,
+`elapsed`, `filename` и счётчики фрагментов; скорость — байт/с, время — секунды.
+Неизвестные размеры — `null`. Поля видео доступны как `%(info.id)s` и т. п.
+`after_move` выводится после успешной постобработки (также для уже готового файла),
+`filepath` — абсолютный путь; при ошибке маркер файла не выводится.
+`--print` повторяемый, включает тихий режим; `--progress` сохраняет прогресс в этом режиме.
+Поддерживаемые стадии печати: `video` (по умолчанию), `before_dl`, `after_move`, `after_video`.
+Только `--print video` подразумевает симуляцию; `--no-simulate` включает загрузку.
+Шаблон прогресса поддерживает тип `download`; другие типы отклоняются с ошибкой.
+
+`-x --audio-format best|mp3|m4a|opus|aac|alac|flac|vorbis|wav` извлекает только аудио.
+Совпадающий кодек копируется, иначе ffmpeg конвертирует звук; `best` сохраняет исходный кодек.
+`--remux-video` принимает один контейнер и копирует дорожки без перекодирования:
+несовместимый кодек приводит к ошибке с сохранением исходника. Правила вида `aac>m4a/mkv`
+пока не поддерживаются. Эти возможности также доступны через `dlp.Options` и `dlp.Request`
+(`ExtractAudio`, `AudioFormat`, `RemuxVideo`, `WindowsFilenames`).
+
+Поддерживаются `--socket-timeout` (ожидание сетевых данных, а не длительность загрузки),
+`--extractor-retries` (повторы временных сетевых ошибок), `--no-warnings` и аргументы
+экстрактора без значения, например `generic:impersonate`. `--ignore-config` принимается,
+поскольку go-dlp не читает конфигурационные файлы; `--encoding` принимает только UTF-8.
+`--js-runtimes RUNTIME[:PATH]` принимается для совместимости: внешний runtime не запускается,
+go-dlp использует встроенный JS-движок.
 
 ## Использование как библиотеки
 

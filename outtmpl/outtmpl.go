@@ -17,7 +17,7 @@ import (
 // Default — шаблон по умолчанию.
 const Default = "%(title)s [%(id)s].%(ext)s"
 
-var reField = regexp.MustCompile(`%\(([^)]*)\)([-#0+ ]*\d*(?:\.\d+)?)([sdifrqj])`)
+var reField = regexp.MustCompile(`%\(([^)]*)\)([-#0+ ]*\d*(?:\.\d+)?)([sdifrqjB])`)
 
 // Fields превращает Info в словарь полей для шаблона.
 func Fields(info *media.Info) map[string]any {
@@ -67,6 +67,15 @@ func setDefault(m map[string]any, k string, v any) {
 // Evaluate подставляет поля в шаблон. Каждое подставленное значение
 // санитизируется (в нём не может появиться разделитель пути).
 func Evaluate(tmpl string, fields map[string]any, restrict bool) string {
+	return evaluate(tmpl, fields, func(s string) string { return Sanitize(s, restrict) })
+}
+
+// Render подставляет поля без обработки имён файлов: для --print и прогресса.
+func Render(tmpl string, fields map[string]any) string {
+	return evaluate(tmpl, fields, func(s string) string { return s })
+}
+
+func evaluate(tmpl string, fields map[string]any, clean func(string) string) string {
 	const pct = "\x00PCT\x00"
 	tmpl = strings.ReplaceAll(tmpl, "%%", pct)
 	out := reField.ReplaceAllStringFunc(tmpl, func(m string) string {
@@ -89,7 +98,7 @@ func Evaluate(tmpl string, fields map[string]any, restrict bool) string {
 		} else {
 			s = format(val, flags, conv)
 		}
-		return Sanitize(s, restrict)
+		return clean(s)
 	})
 	return strings.ReplaceAll(out, pct, "%")
 }
@@ -128,7 +137,7 @@ func format(v any, flags, conv string) string {
 		}
 		return fmt.Sprintf("%"+flags+"d", n)
 	case "f":
-		f, _ := v.(float64)
+		f, _ := strconv.ParseFloat(fmt.Sprint(v), 64)
 		return fmt.Sprintf("%"+flags+"f", f)
 	case "j":
 		b, _ := json.Marshal(v)
@@ -153,7 +162,12 @@ func format(v any, flags, conv string) string {
 	if i := strings.IndexByte(flags, '.'); i >= 0 {
 		if n, err := strconv.Atoi(flags[i+1:]); err == nil {
 			r := []rune(s)
-			if len(r) > n {
+			if conv == "B" {
+				for len(string(r)) > n {
+					r = r[:len(r)-1]
+				}
+				s = string(r)
+			} else if len(r) > n {
 				s = string(r[:n])
 			}
 		}
@@ -195,6 +209,11 @@ func Sanitize(s string, restrict bool) string {
 
 // Filename строит путь: dir + шаблон, длина каждого компонента ограничена.
 func Filename(dir, tmpl string, info *media.Info, restrict bool) string {
+	return FilenameWithWindows(dir, tmpl, info, restrict, false)
+}
+
+// FilenameWithWindows дополнительно исключает зарезервированные имена Windows.
+func FilenameWithWindows(dir, tmpl string, info *media.Info, restrict, windows bool) string {
 	if tmpl == "" {
 		tmpl = Default
 	}
@@ -202,12 +221,31 @@ func Filename(dir, tmpl string, info *media.Info, restrict bool) string {
 	parts := strings.Split(filepath.ToSlash(name), "/")
 	for i, p := range parts {
 		parts[i] = truncateBytes(p, 240)
+		if windows && p != "" && p != "." && p != ".." && p != filepath.VolumeName(name) {
+			parts[i] = windowsComponent(parts[i])
+		}
 	}
 	name = filepath.FromSlash(strings.Join(parts, "/"))
 	if dir != "" && !filepath.IsAbs(name) {
 		name = filepath.Join(dir, name)
 	}
 	return name
+}
+
+func windowsComponent(s string) string {
+	s = strings.TrimRight(Sanitize(s, false), ". ")
+	base, _, _ := strings.Cut(strings.ToUpper(s), ".")
+	reserved := base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" || base == "CONIN$" || base == "CONOUT$"
+	if runes := []rune(base); len(runes) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) {
+		reserved = reserved || strings.ContainsRune("123456789¹²³", runes[3])
+	}
+	if reserved {
+		s = "_" + s
+	}
+	if s == "" {
+		s = "_"
+	}
+	return s
 }
 
 // truncateBytes обрезает имя до max байт, сохраняя расширение.

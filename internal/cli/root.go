@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -49,6 +51,18 @@ type flags struct {
 	updateExtractors                      bool
 	extractorScripts                      string
 	extractorPackURL                      string
+	concurrentDownloads                   int
+	prints, progressTemplates             []string
+	printTemplates                        []stageTemplate
+	progressTemplate                      string
+	extractAudio, windowsFilenames        bool
+	audioFormat, remuxVideo               string
+	newline, showProgress, noColors       bool
+	ignoreConfig, noWarnings, noSimulate  bool
+	encoding                              string
+	jsRuntimes                            []string
+	socketTimeout                         float64
+	extractorRetries                      int
 }
 
 // NewRootCommand создаёт корневую команду.
@@ -123,6 +137,23 @@ func NewRootCommand() *cobra.Command {
 	fl.BoolVar(&f.updateExtractors, "update-extractors", false, "скачать свежий подписанный пакет JS-экстракторов (кеш в каталоге кеша пользователя)")
 	fl.StringVar(&f.extractorScripts, "extractor-scripts", "", "каталог с JS-экстракторами (*.js) для разработки, без подписи")
 	fl.StringVar(&f.extractorPackURL, "extractor-pack-url", "", "URL пакета JS-экстракторов (по умолчанию официальный; подпись — URL+\".sig\")")
+	fl.IntVarP(&f.concurrentDownloads, "concurrent-downloads", "M", 1, "параллельных загрузок видео (воркер-пул; >1 отключает детальный прогресс)")
+	fl.StringArrayVarP(&f.prints, "print", "O", nil, "вывести [video|before_dl|after_move|after_video:]шаблон (повторяемый; включает quiet)")
+	fl.StringArrayVar(&f.progressTemplates, "progress-template", nil, "шаблон прогресса [download:]TEMPLATE; поля info и progress")
+	fl.BoolVarP(&f.extractAudio, "extract-audio", "x", false, "извлечь аудио через ffmpeg")
+	fl.StringVar(&f.audioFormat, "audio-format", "best", "формат аудио с -x: best, mp3, m4a, opus, aac, alac, flac, vorbis, wav")
+	fl.StringVar(&f.remuxVideo, "remux-video", "", "перепаковать результат в один контейнер без перекодирования")
+	fl.BoolVar(&f.windowsFilenames, "windows-filenames", false, "Windows-совместимые имена файлов")
+	fl.BoolVar(&f.newline, "newline", false, "прогресс отдельными строками")
+	fl.BoolVar(&f.showProgress, "progress", false, "показывать прогресс даже в тихом режиме")
+	fl.BoolVar(&f.noColors, "no-colors", false, "вывод без ANSI-последовательностей")
+	fl.BoolVar(&f.ignoreConfig, "ignore-config", false, "не читать конфигурацию (go-dlp не читает её по умолчанию)")
+	fl.BoolVar(&f.noWarnings, "no-warnings", false, "не выводить предупреждения")
+	fl.BoolVar(&f.noSimulate, "no-simulate", false, "скачивать при --print video")
+	fl.StringVar(&f.encoding, "encoding", "utf-8", "кодировка вывода (utf-8)")
+	fl.StringArrayVar(&f.jsRuntimes, "js-runtimes", nil, "совместимость с yt-dlp; go-dlp использует встроенный JS-движок")
+	fl.Float64Var(&f.socketTimeout, "socket-timeout", 0, "тайм-аут ожидания сетевых данных в секундах")
+	fl.IntVar(&f.extractorRetries, "extractor-retries", 0, "повторов экстракции при временных сетевых ошибках")
 
 	cmd.AddCommand(newExtractorsCommand())
 	return cmd
@@ -167,8 +198,8 @@ func ParseExtractorArgs(list []string) (map[string]map[string][]string, error) {
 			out[ie] = map[string][]string{}
 		}
 		for _, kv := range strings.Split(rest, ";") {
-			k, v, ok := strings.Cut(kv, "=")
-			if !ok {
+			k, v, _ := strings.Cut(kv, "=")
+			if strings.TrimSpace(k) == "" {
 				return nil, fmt.Errorf("invalid extractor arg %q", kv)
 			}
 			out[ie][strings.TrimSpace(k)] = strings.Split(v, ",")
@@ -202,6 +233,13 @@ func ParseSize(s string) (int64, error) {
 }
 
 func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string) error {
+	if err := f.prepareOutput(); err != nil {
+		return err
+	}
+	// Все воркеры и колбэки пишут целые строки под общей блокировкой.
+	var outputMu sync.Mutex
+	stdout = &lockedWriter{mu: &outputMu, w: stdout}
+	stderr = &lockedWriter{mu: &outputMu, w: stderr}
 	level := slog.LevelInfo
 	switch {
 	case f.verbose:
@@ -209,7 +247,11 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 	case f.quiet:
 		level = slog.LevelError
 	}
-	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
+	var handler slog.Handler = slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level})
+	if f.noWarnings {
+		handler = &noWarningsHandler{Handler: handler}
+	}
+	logger := slog.New(handler)
 
 	eargs, err := ParseExtractorArgs(f.extractorArgs)
 	if err != nil {
@@ -224,9 +266,22 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 		return err
 	}
 	printOnly := f.dumpJSON || f.dumpSingleJSON || f.getURL || f.getTitle || f.getFilename || f.listFormats
+	if f.printOnly() && !f.noSimulate {
+		printOnly = true
+	}
+	workers := f.concurrentDownloads
+	if workers < 1 {
+		workers = 1
+	}
+	// Параллелим только реальную загрузку: режимы вывода и симуляции должны
+	// сохранять порядок строк и идут последовательно.
+	parallel := workers > 1 && !printOnly && !f.simulate && !f.skipDownload
 	var progress *progressPrinter
-	if !f.quiet && !f.noProgress && !printOnly {
+	// Единая строка прогресса (\r) рассчитана на одну активную загрузку — при
+	// нескольких воркерах её заменяют построчные сообщения по каждому видео.
+	if (!f.quiet || f.showProgress) && !f.noProgress && !printOnly && !parallel && f.progressTemplate == "" {
 		progress = newProgressPrinter(stderr)
+		progress.newline, progress.noColors = f.newline, f.noColors
 	}
 	var customMerger postprocess.Merger
 	var preferFFmpeg *bool
@@ -245,6 +300,12 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 		OutputDir:           f.paths,
 		RestrictFilenames:   f.restrict,
 		MergeOutputFormat:   f.mergeFormat,
+		ExtractAudio:        f.extractAudio,
+		AudioFormat:         f.audioFormat,
+		RemuxVideo:          f.remuxVideo,
+		WindowsFilenames:    f.windowsFilenames,
+		SocketTimeout:       time.Duration(f.socketTimeout * float64(time.Second)),
+		ExtractorRetries:    f.extractorRetries,
 		Overwrite:           f.forceOverwrites,
 		ExtractorArgs:       eargs,
 		Proxy:               f.proxy,
@@ -284,25 +345,78 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 		u.CacheDir = filepath.Join(dir, "go-dlp", "extractors")
 	}
 	if f.extractorScripts == "" {
-		if _, err := u.LoadCache(client.Scripts()); err != nil {
+		if _, err := u.LoadCache(client.Scripts()); err != nil && !f.noWarnings {
 			fmt.Fprintln(stderr, "WARNING: extractor pack cache:", err)
 		}
 	}
 	if f.updateExtractors {
-		if _, err := u.Check(ctx, client.Scripts()); err != nil {
+		if _, err := u.Check(ctx, client.Scripts()); err != nil && !f.noWarnings {
 			fmt.Fprintln(stderr, "WARNING: extractor update failed:", err)
 		}
 		fmt.Fprintf(stderr, "[go-dlp] extractor pack version %d\n", client.Scripts().Version())
 	}
 
+	var mu sync.Mutex
 	failed := 0
 	report := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
 		failed++
 		fmt.Fprintln(stderr, "ERROR:", err)
 	}
+	process := func(e *media.Info) {
+		if err := handleVideo(ctx, client, stdout, stderr, f, e, printOnly, progress); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			report(fmt.Errorf("%s: %w", e.ID, err))
+		}
+	}
+
+	// Воркер-пул: при parallel загрузки идут в workers горутин, иначе работа
+	// выполняется синхронно прямо в продюсере (поведение по умолчанию).
+	var (
+		jobs chan *media.Info
+		wg   sync.WaitGroup
+	)
+	if parallel {
+		jobs = make(chan *media.Info)
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for e := range jobs {
+					if ctx.Err() != nil {
+						continue // отмена: дренируем очередь, новые не начинаем
+					}
+					process(e)
+				}
+			}()
+		}
+	}
+	// emit отправляет готовый элемент воркерам (parallel) либо обрабатывает его
+	// на месте (последовательный режим).
+	emit := func(e *media.Info, err error) error {
+		if err != nil {
+			report(err)
+			return nil
+		}
+		if !parallel {
+			process(e)
+			return nil
+		}
+		select {
+		case jobs <- e:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	var fatal error
 	for _, u := range urls {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			break
 		}
 		info, err := client.Extract(ctx, u)
 		if err != nil {
@@ -315,22 +429,22 @@ func run(ctx context.Context, stdout, stderr io.Writer, f *flags, urls []string)
 			}
 			continue
 		}
-		err = client.Walk(ctx, info, func(e *media.Info, err error) error {
-			if err != nil {
-				report(err)
-				return nil
-			}
-			if err := handleVideo(ctx, client, stdout, stderr, f, e, printOnly, progress); err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				report(fmt.Errorf("%s: %w", e.ID, err))
-			}
-			return nil
-		})
-		if err != nil {
-			return err
+		if err := client.Walk(ctx, info, func(e *media.Info, err error) error {
+			return emit(e, err)
+		}); err != nil {
+			fatal = err
+			break
 		}
+	}
+	if parallel {
+		close(jobs)
+		wg.Wait()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if fatal != nil {
+		return fatal
 	}
 	if failed > 0 && !f.ignoreErrs {
 		return fmt.Errorf("%d error(s)", failed)
@@ -348,6 +462,9 @@ func handleVideo(ctx context.Context, c *dlp.Client, stdout, stderr io.Writer, f
 		return err
 	}
 	for _, p := range prepared {
+		if err := f.printStage(stdout, "video", p); err != nil {
+			return err
+		}
 		if f.getTitle {
 			fmt.Fprintln(stdout, p.Title)
 		}
@@ -373,7 +490,17 @@ func handleVideo(ctx context.Context, c *dlp.Client, stdout, stderr io.Writer, f
 	if !f.quiet {
 		fmt.Fprintf(stderr, "[%s] %s: %s (format %s)\n", info.Extractor, info.ID, info.Title, prepared[0].FormatID)
 	}
-	results, err := c.DownloadVideo(ctx, info)
+	for _, p := range prepared {
+		if err := f.printStage(stdout, "before_dl", p); err != nil {
+			return err
+		}
+	}
+	req := dlp.Request{}
+	if f.progressTemplate != "" && (!f.quiet || f.showProgress) && !f.noProgress {
+		printer := &progressPrinter{w: stdout, template: f.progressTemplate, info: info}
+		req.Progress = printer.update
+	}
+	results, err := c.DownloadVideoWith(ctx, info, req)
 	if pp != nil {
 		pp.done()
 	}
@@ -382,6 +509,13 @@ func handleVideo(ctx context.Context, c *dlp.Client, stdout, stderr io.Writer, f
 	}
 	var errs []error
 	for _, r := range results {
+		if r.Err == nil {
+			for _, stage := range []string{"after_move", "after_video"} {
+				if err := f.printStage(stdout, stage, r.Info); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
 		switch {
 		case r.Err != nil:
 			errs = append(errs, r.Err)

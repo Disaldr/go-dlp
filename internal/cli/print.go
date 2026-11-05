@@ -10,6 +10,7 @@ import (
 
 	"github.com/Disaldr/go-dlp/downloader"
 	"github.com/Disaldr/go-dlp/media"
+	"github.com/Disaldr/go-dlp/outtmpl"
 )
 
 // HumanBytes форматирует размер как в yt-dlp: 12.34MiB.
@@ -68,9 +69,12 @@ func orDash(s string) string {
 
 // progressPrinter рисует строку прогресса в стиле yt-dlp.
 type progressPrinter struct {
-	mu   sync.Mutex
-	w    io.Writer
-	open bool
+	mu                sync.Mutex
+	w                 io.Writer
+	open              bool
+	newline, noColors bool
+	template          string
+	info              *media.Info
 }
 
 func newProgressPrinter(w io.Writer) *progressPrinter { return &progressPrinter{w: w} }
@@ -78,6 +82,24 @@ func newProgressPrinter(w io.Writer) *progressPrinter { return &progressPrinter{
 func (p *progressPrinter) update(pr downloader.Progress) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.template != "" {
+		fields := map[string]any{
+			"status": string(pr.Status), "filename": pr.Filename,
+			"downloaded_bytes": pr.Downloaded, "speed": pr.Speed,
+			"eta": pr.ETA.Seconds(), "elapsed": pr.Elapsed.Seconds(),
+			"fragment_index": pr.FragmentIndex, "fragment_count": pr.FragmentCount,
+			"total_bytes": nil, "total_bytes_estimate": nil,
+		}
+		if pr.Total > 0 {
+			key := "total_bytes"
+			if pr.TotalEstimated {
+				key = "total_bytes_estimate"
+			}
+			fields[key] = pr.Total
+		}
+		fmt.Fprintln(p.w, outtmpl.Render(p.template, map[string]any{"progress": fields, "info": outtmpl.Fields(p.info)}))
+		return
+	}
 	pct := "  ?.?%"
 	if v := pr.Percent(); v >= 0 {
 		pct = fmt.Sprintf("%5.1f%%", v)
@@ -96,7 +118,15 @@ func (p *progressPrinter) update(pr downloader.Progress) {
 	if pr.Status == downloader.StatusFinished {
 		line = fmt.Sprintf("\r[download] 100%% of %10s in %s at %s/s", HumanBytes(float64(pr.Downloaded)), fmtETA(pr.Elapsed), HumanBytes(pr.Speed))
 	}
-	fmt.Fprint(p.w, line+"\033[K")
+	if p.newline {
+		fmt.Fprintln(p.w, strings.TrimPrefix(line, "\r"))
+		p.open = false
+		return
+	}
+	if !p.noColors {
+		line += "\033[K"
+	}
+	fmt.Fprint(p.w, line)
 	p.open = true
 	if pr.Status == downloader.StatusFinished {
 		fmt.Fprintln(p.w)

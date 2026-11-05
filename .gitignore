@@ -3,3 +3,4 @@
 /.claude/
 *.part
 dist/
+.DS_Store

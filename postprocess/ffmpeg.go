@@ -109,6 +109,10 @@ func muxer(out string) string {
 		return "mp4"
 	case "ts":
 		return "mpegts"
+	case "aac":
+		return "adts"
+	case "mka":
+		return "matroska"
 	case "", "part":
 		return "matroska"
 	}
