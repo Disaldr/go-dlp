@@ -154,7 +154,27 @@ func protocol(u string) string {
 	return media.ProtoHTTPS
 }
 
-var reM3U8 = regexp.MustCompile(`https?:\\?/\\?/[^"'\s<>]+?\.m3u8(?:\?[^"'\s<>]*)?`)
+// reMediaURL — прямая ссылка на медиа (HLS/DASH/прогрессив) в разметке/скриптах.
+var reMediaURL = regexp.MustCompile(`https?:\\?/\\?/[^"'\s<>]+?\.(?:m3u8|mpd|mp4|m4v|webm)(?:\?[^"'\s<>]*)?`)
+
+// rePlayerSource — медиа-URL в конфигах плееров и JSON-состоянии страницы
+// (JWPlayer/Playerjs/онлайн-кинотеатры, а также __NEXT_DATA__ / window.__*__,
+// т.к. поиск идёт по всей странице): "file"/"hls"/"src"/"manifest": "...".
+var rePlayerSource = regexp.MustCompile(`["']?(?:file|src|source|hls|dash|manifest|playlist|stream_url|videoUrl|contentUrl)["']?\s*:\s*["']([^"']+?\.(?:m3u8|mpd|mp4|m4v|webm)(?:\\?\?[^"']*)?)["']`)
+
+// playerSourceURLs вытаскивает медиа-URL из конфигов плееров и JSON страницы.
+func playerSourceURLs(page string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range rePlayerSource.FindAllStringSubmatch(page, -1) {
+		u := strings.ReplaceAll(m[1], `\/`, "/")
+		if u != "" && !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
+}
 
 // setImpersonate проставляет цель имитации всем форматам (пусто — ничего).
 func setImpersonate(fs []*media.Format, imp string) {
@@ -275,8 +295,13 @@ func (g *Generic) fromHTML(ctx context.Context, env *ex.Env, rawURL, pageURL, id
 			}
 		}
 	}
+	// 2c. Медиа из конфигов плееров и JSON-состояния (онлайн-кинотеатры и пр.).
+	for _, u := range playerSourceURLs(page) {
+		addCand(u)
+	}
+	// Последняя попытка: любые прямые ссылки на медиа в разметке.
 	if len(candidates) == 0 && len(embeds) == 0 {
-		for _, m := range reM3U8.FindAllString(page, 5) {
+		for _, m := range reMediaURL.FindAllString(page, 10) {
 			addCand(m)
 		}
 	}
