@@ -419,7 +419,8 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
   Если `visionos` не дал форматов (например, «Sign in to confirm you're not a bot»),
   автоматически пробуется `tv_simply`: подписи и n расшифровываются в goja, PO Token не нужен.
   При cookies аккаунта запросы клиентов `web`/`tv` подписываются `SAPISIDHASH`.
-- DASH: в статических манифестах берётся первый Period, живые — только SegmentTemplate; DRM не поддерживается.
+- DASH: статические манифесты с несколькими Period склеиваются (сегменты одинаковых представлений);
+  живые (dynamic) поддерживают SegmentTemplate и SegmentList у live-края; живой SegmentBase и DRM не поддерживаются.
 - Логин по паролю не поддерживается — используйте `--cookies` (Netscape `cookies.txt` или JSON-экспорт
   Cookie-Editor/EditThisCookie) либо `--cookies-from-browser BROWSER[:PROFILE]` (Firefox, Chromium-браузеры
   с расшифровкой средствами ОС, Safari на macOS).

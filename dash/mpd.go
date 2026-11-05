@@ -164,98 +164,154 @@ func ParseManifest(body []byte, manifestURL, idPrefix string) (*Manifest, error)
 		man.MinimumUpdatePeriod = time.Duration(ParseDuration(m.MinimumUpdatePeriod) * float64(time.Second))
 	}
 	base := join(manifestURL, first(m.BaseURL))
-	// в живом манифесте актуален последний начавшийся период
-	p := m.Periods[0]
+	// В живом манифесте актуален последний начавшийся период; в статическом
+	// обходим все периоды и склеиваем сегменты одинаковых представлений.
+	periods := m.Periods
 	if man.Dynamic {
-		p = m.Periods[len(m.Periods)-1]
+		periods = m.Periods[len(m.Periods)-1:]
 	}
-	lv.periodStart = ParseDuration(p.Start)
-	periodDur := ParseDuration(p.Duration)
-	if periodDur == 0 && !man.Dynamic {
-		periodDur = ParseDuration(m.Duration)
-	}
-	pbase := join(base, first(p.BaseURL))
 
 	var out []*media.Format
-	seen := map[string]int{}
-	for _, as := range p.Sets {
-		abase := join(pbase, first(as.BaseURL))
-		for _, r := range as.Reps {
-			c := merge(as.common, r.common)
-			if len(c.Protection) > 0 {
-				continue // DRM
-			}
-			mt := c.MimeType
-			if mt == "" {
-				mt = c.ContentType
-			}
-			kind := strings.SplitN(mt, "/", 2)[0]
-			if kind != "video" && kind != "audio" {
-				continue // text/image и пр.
-			}
-			f := &media.Format{
-				ManifestURL:        manifestURL,
-				Live:               man.Dynamic,
-				DASHRepresentation: r.ID,
-				Width:              c.Width,
-				Height:             c.Height,
-				FPS:                parseFrameRate(c.FrameRate),
-				ASR:                c.SamplingRate,
-				TBR:                float64(r.Bandwidth) / 1000,
-				Language:           as.Lang,
-				Container:          containerOf(mt),
-			}
-			f.Ext = extOf(mt, kind)
-			codec := c.Codecs
-			if kind == "video" {
-				f.VCodec, f.ACodec, f.VBR = codec, media.CodecNone, f.TBR
-			} else {
-				f.VCodec, f.ACodec, f.ABR = media.CodecNone, codec, f.TBR
-				if len(c.Channels) > 0 {
-					f.AudioChannels, _ = strconv.Atoi(c.Channels[0].Value)
-				}
-			}
-			id := r.ID
-			if id == "" {
-				id = strconv.FormatInt(r.Bandwidth, 10)
-			}
-			f.FormatID = idPrefix + "-" + id
-			if n := seen[f.FormatID]; n > 0 {
-				f.FormatID += fmt.Sprintf("-%d", n)
-			}
-			seen[idPrefix+"-"+id]++
-
-			rbase := join(abase, first(r.BaseURL))
-			tmpl := r.Template
-			if tmpl == nil {
-				tmpl = as.Template
-			}
-			list := r.List
-			if list == nil {
-				list = as.List
-			}
-			switch {
-			case tmpl != nil:
-				frags, err := fromTemplate(tmpl, rbase, r, periodDur, lv)
+	byKey := map[string]*media.Format{}
+	for pi := range periods {
+		p := periods[pi]
+		lv.periodStart = ParseDuration(p.Start)
+		periodDur := periodDuration(m, periods, pi, man.Dynamic)
+		pbase := join(base, first(p.BaseURL))
+		seen := map[string]int{}
+		for _, as := range p.Sets {
+			abase := join(pbase, first(as.BaseURL))
+			for _, r := range as.Reps {
+				f, err := repFormat(manifestURL, idPrefix, as, r, abase, periodDur, lv, man, seen)
 				if err != nil {
 					return nil, err
 				}
-				f.Fragments, f.Protocol = frags, media.ProtoDASH
-				f.URL = rbase
-			case man.Dynamic:
-				continue // живые SegmentList/SegmentBase не поддерживаются
-			case list != nil:
-				f.Fragments, f.Protocol = fromList(list, rbase), media.ProtoDASH
-				f.URL = rbase
-			default:
-				// один файл (с SegmentBase или без) — качаем целиком как обычный HTTPS
-				f.URL, f.Protocol = rbase, media.ProtoHTTPS
+				if f == nil {
+					continue
+				}
+				if existing := byKey[f.FormatID]; existing != nil {
+					// То же представление в следующем периоде — дописываем
+					// медиасегменты (init берётся только из первого периода).
+					if len(existing.Fragments) > 0 && len(f.Fragments) > 0 {
+						for _, fr := range f.Fragments {
+							if fr.Init {
+								continue
+							}
+							existing.Fragments = append(existing.Fragments, fr)
+						}
+					}
+					continue
+				}
+				byKey[f.FormatID] = f
+				out = append(out, f)
 			}
-			out = append(out, f)
 		}
 	}
 	man.Formats = out
 	return man, nil
+}
+
+// periodDuration вычисляет длительность периода: явная p.Duration, иначе
+// (start следующего − start текущего), иначе (общая длительность − start).
+func periodDuration(m mpdXML, periods []periodXML, i int, dynamic bool) float64 {
+	p := periods[i]
+	if d := ParseDuration(p.Duration); d > 0 {
+		return d
+	}
+	start := ParseDuration(p.Start)
+	if i+1 < len(periods) {
+		if next := ParseDuration(periods[i+1].Start); next > start {
+			return next - start
+		}
+	}
+	if !dynamic {
+		if total := ParseDuration(m.Duration); total > start {
+			return total - start
+		}
+	}
+	return 0
+}
+
+// repFormat строит формат для одного Representation (nil — пропустить: DRM,
+// не медиа, неподдержанный живой SegmentBase). seen дизамбигуирует id внутри
+// периода.
+func repFormat(manifestURL, idPrefix string, as adaptation, r representation, abase string, periodDur float64, lv live, man *Manifest, seen map[string]int) (*media.Format, error) {
+	c := merge(as.common, r.common)
+	if len(c.Protection) > 0 {
+		return nil, nil // DRM
+	}
+	mt := c.MimeType
+	if mt == "" {
+		mt = c.ContentType
+	}
+	kind := strings.SplitN(mt, "/", 2)[0]
+	if kind != "video" && kind != "audio" {
+		return nil, nil // text/image и пр.
+	}
+	f := &media.Format{
+		ManifestURL:        manifestURL,
+		Live:               man.Dynamic,
+		DASHRepresentation: r.ID,
+		Width:              c.Width,
+		Height:             c.Height,
+		FPS:                parseFrameRate(c.FrameRate),
+		ASR:                c.SamplingRate,
+		TBR:                float64(r.Bandwidth) / 1000,
+		Language:           as.Lang,
+		Container:          containerOf(mt),
+	}
+	f.Ext = extOf(mt, kind)
+	codec := c.Codecs
+	if kind == "video" {
+		f.VCodec, f.ACodec, f.VBR = codec, media.CodecNone, f.TBR
+	} else {
+		f.VCodec, f.ACodec, f.ABR = media.CodecNone, codec, f.TBR
+		if len(c.Channels) > 0 {
+			f.AudioChannels, _ = strconv.Atoi(c.Channels[0].Value)
+		}
+	}
+	id := r.ID
+	if id == "" {
+		id = strconv.FormatInt(r.Bandwidth, 10)
+	}
+	f.FormatID = idPrefix + "-" + id
+	if n := seen[idPrefix+"-"+id]; n > 0 {
+		f.FormatID += fmt.Sprintf("-%d", n)
+	}
+	seen[idPrefix+"-"+id]++
+
+	rbase := join(abase, first(r.BaseURL))
+	tmpl := r.Template
+	if tmpl == nil {
+		tmpl = as.Template
+	}
+	list := r.List
+	if list == nil {
+		list = as.List
+	}
+	switch {
+	case tmpl != nil:
+		frags, err := fromTemplate(tmpl, rbase, r, periodDur, lv)
+		if err != nil {
+			return nil, err
+		}
+		f.Fragments, f.Protocol = frags, media.ProtoDASH
+		f.URL = rbase
+	case list != nil:
+		frags := fromList(list, rbase)
+		if man.Dynamic {
+			// Живой SegmentList: пишем от live-края и перечитываем манифест.
+			frags = liveEdge(frags)
+		}
+		f.Fragments, f.Protocol = frags, media.ProtoDASH
+		f.URL = rbase
+	case man.Dynamic:
+		return nil, nil // живой SegmentBase не поддерживается
+	default:
+		// один файл (с SegmentBase или без) — качаем целиком как обычный HTTPS
+		f.URL, f.Protocol = rbase, media.ProtoHTTPS
+	}
+	return f, nil
 }
 
 func merge(a, b common) common {

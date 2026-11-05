@@ -155,3 +155,92 @@ func TestLiveTimelineOpenEnded(t *testing.T) {
 		t.Errorf("fragments = %v", urls)
 	}
 }
+
+// Многопериодный статический манифест: сегменты одинаковых представлений из
+// всех периодов склеиваются (init — только из первого периода).
+const multiPeriodMPD = `<MPD type="static" mediaPresentationDuration="PT8S">
+ <Period id="p0" start="PT0S" duration="PT4S">
+  <AdaptationSet mimeType="video/mp4" codecs="avc1.4d401f">
+   <SegmentTemplate media="p0/$Number$.m4s" initialization="p0/init.mp4" startNumber="1" timescale="1000" duration="4000"/>
+   <Representation id="v" bandwidth="1000000" width="640" height="360"/>
+  </AdaptationSet>
+ </Period>
+ <Period id="p1" start="PT4S" duration="PT4S">
+  <AdaptationSet mimeType="video/mp4" codecs="avc1.4d401f">
+   <SegmentTemplate media="p1/$Number$.m4s" initialization="p1/init.mp4" startNumber="1" timescale="1000" duration="4000"/>
+   <Representation id="v" bandwidth="1000000" width="640" height="360"/>
+  </AdaptationSet>
+ </Period>
+</MPD>`
+
+func TestMultiPeriod(t *testing.T) {
+	fs, err := Parse([]byte(multiPeriodMPD), "https://e.com/m.mpd", "dash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fs) != 1 {
+		t.Fatalf("got %d formats, want 1 (merged across periods)", len(fs))
+	}
+	var urls []string
+	for _, fr := range fs[0].Fragments {
+		urls = append(urls, fr.URL)
+	}
+	// init(p0) + seg p0/1 + seg p1/1 — init из p1 опущен.
+	want := []string{"https://e.com/p0/init.mp4", "https://e.com/p0/1.m4s", "https://e.com/p1/1.m4s"}
+	if len(urls) != len(want) {
+		t.Fatalf("fragments = %v, want %v", urls, want)
+	}
+	for i := range want {
+		if urls[i] != want[i] {
+			t.Errorf("fragment %d = %s, want %s", i, urls[i], want[i])
+		}
+	}
+}
+
+// Живой манифест с SegmentList: отдаётся init + последние LiveEdgeSegments.
+const liveListMPD = `<MPD type="dynamic" availabilityStartTime="2020-01-01T00:00:00Z" minimumUpdatePeriod="PT2S">
+ <Period>
+  <AdaptationSet mimeType="video/mp4" codecs="avc1">
+   <Representation id="v" bandwidth="800000" height="480">
+    <SegmentList duration="2" timescale="1">
+     <Initialization sourceURL="init.mp4"/>
+     <SegmentURL media="s1.m4s"/>
+     <SegmentURL media="s2.m4s"/>
+     <SegmentURL media="s3.m4s"/>
+     <SegmentURL media="s4.m4s"/>
+     <SegmentURL media="s5.m4s"/>
+    </SegmentList>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>`
+
+func TestLiveSegmentList(t *testing.T) {
+	old := LiveEdgeSegments
+	LiveEdgeSegments = 3
+	defer func() { LiveEdgeSegments = old }()
+
+	man, err := ParseManifest([]byte(liveListMPD), "https://e.com/m.mpd", "dash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !man.Dynamic || man.MinimumUpdatePeriod != 2*time.Second {
+		t.Fatalf("dynamic=%v mup=%v", man.Dynamic, man.MinimumUpdatePeriod)
+	}
+	if len(man.Formats) != 1 {
+		t.Fatalf("got %d formats", len(man.Formats))
+	}
+	f := man.Formats[0]
+	if f.Protocol != media.ProtoDASH || !f.Live {
+		t.Errorf("protocol=%s live=%v", f.Protocol, f.Live)
+	}
+	var urls []string
+	for _, fr := range f.Fragments {
+		urls = append(urls, fr.URL)
+	}
+	// init + 3 последних сегмента (s3,s4,s5).
+	want := []string{"https://e.com/init.mp4", "https://e.com/s3.m4s", "https://e.com/s4.m4s", "https://e.com/s5.m4s"}
+	if strings.Join(urls, ",") != strings.Join(want, ",") {
+		t.Errorf("fragments = %v, want %v", urls, want)
+	}
+}
