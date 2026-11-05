@@ -419,7 +419,9 @@ GODLP_ONLINE=1 go test ./extractors/all -run Online -v   # реальные за
   (от браузера/провайдера) — тогда клиент `web` становится рабочим:
   `--extractor-args "youtube:player_client=web;po_token=web.gvs+XXXX,web.player+YYYY"` (контексты
   `gvs`/`player`/`subs`; ключ без клиента применяется ко всем). Клиент `tv` возвращает UNPLAYABLE,
-  поэтому `web`/`tv` не включены по умолчанию.
+  поэтому `web`/`tv` не включены по умолчанию. SABR пока не подключён к загрузке; в пакете
+  `extractors/youtube/sabr` есть проверяемый каркас (кодек UMP и protobuf-wire) — полный цикл
+  требует PO Token и проверки против живого YouTube.
   Если `visionos` не дал форматов (например, «Sign in to confirm you're not a bot»),
   автоматически пробуется `tv_simply`: подписи и n расшифровываются в goja, PO Token не нужен.
   При cookies аккаунта запросы клиентов `web`/`tv` подписываются `SAPISIDHASH`.
