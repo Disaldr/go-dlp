@@ -89,8 +89,12 @@ func (t *Tab) Extract(ctx context.Context, env *ex.Env, rawURL string) (*media.I
 		info.ChannelURL = baseURL + "/channel/" + cid
 	}
 	info.Entries, err = collectEntries(ctx, env, data, ytcfg, env.MaxEntries)
-	if err != nil && len(info.Entries) == 0 {
-		return nil, ex.Wrap(playlistKey, id, err, "unable to fetch entries")
+	if err != nil {
+		if len(info.Entries) == 0 {
+			return nil, ex.Wrap(playlistKey, id, err, "unable to fetch entries")
+		}
+		// часть элементов собрана, но пагинация прервалась — не молчим
+		env.Warn("youtube: playlist pagination stopped early", "id", id, "entries", len(info.Entries), "err", err)
 	}
 	info.PlaylistCount = len(info.Entries)
 	return info, nil
@@ -182,31 +186,115 @@ type continuation struct {
 	apiURL string
 }
 
+// videoRendererKeys — ключи рендереров, которые entriesFrom считает видео.
+var videoRendererKeys = []string{
+	"playlistVideoRenderer", "videoRenderer", "gridVideoRenderer",
+	"compactVideoRenderer", "richItemRenderer", "reelItemRenderer",
+	"shortsLockupViewModel", "lockupViewModel",
+}
+
+// isVideoItem — элемент списка с одним из видео-рендереров.
+func isVideoItem(m map[string]any) bool {
+	for _, k := range videoRendererKeys {
+		if _, ok := m[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// continuationFrom извлекает токен continuation из ноды continuationItemRenderer
+// (через continuationEndpoint) или continuationItemViewModel (через
+// continuationCommand, новый layout плейлистов).
+func continuationFrom(node any) *continuation {
+	ep := ex.Map(node, "continuationEndpoint")
+	cc := ex.Map(node, "continuationCommand")
+	tok := ex.Str(ep, "continuationCommand", "token")
+	if tok == "" {
+		tok = ex.Str(cc, "innertubeCommand", "continuationCommand", "token")
+	}
+	if tok == "" {
+		tok = ex.Str(cc, "token")
+	}
+	if tok == "" {
+		// формат commandExecutorCommand.commands[].continuationCommand
+		for _, cmd := range ex.Slice(ep, "commandExecutorCommand", "commands") {
+			if t := ex.Str(cmd, "continuationCommand", "token"); t != "" {
+				tok = t
+			}
+		}
+	}
+	if tok == "" {
+		return nil
+	}
+	api := ex.Str(ep, "commandMetadata", "webCommandMetadata", "apiUrl")
+	if api == "" {
+		api = ex.Str(cc, "innertubeCommand", "commandMetadata", "webCommandMetadata", "apiUrl")
+	}
+	if api == "" {
+		api = "/youtubei/v1/browse"
+		if ex.Str(ep, "continuationCommand", "request") == "CONTINUATION_REQUEST_TYPE_SEARCH" ||
+			ex.Str(cc, "innertubeCommand", "continuationCommand", "request") == "CONTINUATION_REQUEST_TYPE_SEARCH" {
+			api = "/youtubei/v1/search"
+		}
+	}
+	return &continuation{token: tok, apiURL: api}
+}
+
+// findContinuation ищет continuation списка видео: токен, лежащий в том же
+// массиве, что и видео-рендереры. Привязка к массиву видео исключает
+// continuation посторонних секций страницы — в первую очередь комментариев,
+// чей continuationItemRenderer раньше ошибочно подхватывался первым (из-за чего
+// плейлист обрывался на первой странице). Поддерживаются оба формата ноды:
+// continuationItemRenderer (классический) и continuationItemViewModel (новый).
 func findContinuation(data any) *continuation {
-	for _, c := range ex.FindAll(data, "continuationItemRenderer") {
-		ep := ex.Map(c, "continuationEndpoint")
-		tok := ex.Str(ep, "continuationCommand", "token")
-		if tok == "" {
-			// новый формат: commandExecutorCommand.commands[].continuationCommand
-			for _, cmd := range ex.Slice(ep, "commandExecutorCommand", "commands") {
-				if t := ex.Str(cmd, "continuationCommand", "token"); t != "" {
-					tok = t
+	var found *continuation
+	var walk func(any)
+	walk = func(x any) {
+		if found != nil {
+			return
+		}
+		switch t := x.(type) {
+		case []any:
+			hasVideo := false
+			var contNode any
+			for _, v := range t {
+				m, ok := v.(map[string]any)
+				if !ok {
+					continue
+				}
+				if isVideoItem(m) {
+					hasVideo = true
+				}
+				if n, ok := m["continuationItemRenderer"]; ok {
+					contNode = n
+				} else if n, ok := m["continuationItemViewModel"]; ok {
+					contNode = n
+				}
+			}
+			if hasVideo && contNode != nil {
+				if c := continuationFrom(contNode); c != nil {
+					found = c
+					return
+				}
+			}
+			for _, v := range t {
+				walk(v)
+				if found != nil {
+					return
+				}
+			}
+		case map[string]any:
+			for _, k := range sortedKeys(t) {
+				walk(t[k])
+				if found != nil {
+					return
 				}
 			}
 		}
-		if tok == "" {
-			continue
-		}
-		api := ex.Str(ep, "commandMetadata", "webCommandMetadata", "apiUrl")
-		if api == "" {
-			api = "/youtubei/v1/browse"
-			if ex.Str(ep, "continuationCommand", "request") == "CONTINUATION_REQUEST_TYPE_SEARCH" {
-				api = "/youtubei/v1/search"
-			}
-		}
-		return &continuation{token: tok, apiURL: api}
 	}
-	return nil
+	walk(data)
+	return found
 }
 
 // collectEntries собирает видео со страницы и всех continuation-страниц.
