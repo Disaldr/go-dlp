@@ -166,6 +166,22 @@ type Request struct {
 	SubtitleLangs []string
 	// Progress — колбэк прогресса именно этой загрузки.
 	Progress downloader.ProgressFunc
+	// NoPlaylist — для URL «видео в плейлисте» на этот вызов брать только
+	// видео (nil — наследовать из Options). Учитывается в ExtractWith и
+	// DownloadWith.
+	NoPlaylist *bool
+}
+
+// CloneOptions — сетевые переопределения для Client.Clone. Пустые строковые
+// поля наследуются из исходного клиента; клон всегда получает собственный
+// HTTP-клиент и cookie-jar.
+type CloneOptions struct {
+	CookiesFile        string
+	CookiesFromBrowser string
+	UserAgent          string
+	Proxy              string
+	Impersonate        string
+	NoPlaylist         *bool
 }
 
 // callOpts — эффективные настройки одной загрузки (Options ⊕ Request).
@@ -234,76 +250,11 @@ func New(opts Options) (*Client, error) {
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
 	}
-	hc := opts.HTTPClient
-	if hc == nil {
-		var proxy *url.URL
-		if opts.Proxy != "" {
-			p, err := url.Parse(opts.Proxy)
-			if err != nil {
-				return nil, fmt.Errorf("invalid proxy: %w", err)
-			}
-			proxy = p
-		}
-		hc = extractor.DefaultHTTPClient(proxy)
-	}
-	hc = extractor.WithSocketTimeout(hc, opts.SocketTimeout)
-	ua := opts.UserAgent
-	if ua == "" {
-		ua = extractor.DefaultUserAgent
-	}
-	args := map[string]map[string][]string{}
-	for ie, kv := range opts.ExtractorArgs {
-		args[strings.ToLower(ie)] = kv
-	}
-	// Если пользователь берёт cookies из браузера, но не задал имитацию и
-	// User-Agent, по умолчанию имитируем тот же браузер. Защитные cookies
-	// (cf_clearance Cloudflare, datadome и т.п.) привязаны к TLS-отпечатку и
-	// User-Agent браузера, который их выдал; без совпадения сервер их не
-	// примет и снова покажет проверку. Это не обход проверки, а продолжение
-	// уже пройденной пользователем в его же браузере сессии.
-	imp := opts.Impersonate
-	if imp == "" && opts.CookiesFromBrowser != "" && opts.UserAgent == "" {
-		if t := browserImpersonate(opts.CookiesFromBrowser); t != "" {
-			imp = t
-			c.log.Debug("matching TLS/User-Agent to browser for its cookies", "impersonate", imp)
-		}
-	}
-	if imp != "" {
-		if _, err := impersonate.Lookup(imp); err != nil {
-			return nil, err
-		}
-	}
-	var proxyFn impersonate.ProxyFunc
-	if opts.Proxy != "" {
-		p, _ := url.Parse(opts.Proxy)
-		proxyFn = http.ProxyURL(p)
-	}
-	creds, err := buildCredStore(opts)
+	env, err := buildEnv(opts, c.reg, c.log)
 	if err != nil {
 		return nil, err
 	}
-	c.env = &extractor.Env{
-		HTTP: hc, UserAgent: ua, Logger: c.log, Registry: c.reg,
-		Args: args, NoPlaylist: opts.NoPlaylist, MaxEntries: opts.PlaylistEnd,
-		Impersonate:   imp,
-		Impersonator:  &impersonate.Pool{Jar: hc.Jar, Proxy: proxyFn},
-		Creds:         creds,
-		SocketTimeout: opts.SocketTimeout,
-	}
-	if opts.CookiesFromBrowser != "" {
-		n, err := extractor.LoadCookiesFromBrowser(hc, opts.CookiesFromBrowser)
-		if err != nil {
-			return nil, fmt.Errorf("load browser cookies: %w", err)
-		}
-		c.log.Debug("browser cookies loaded", "count", n)
-	}
-	if opts.CookiesFile != "" {
-		n, err := extractor.LoadCookiesFile(hc, opts.CookiesFile)
-		if err != nil {
-			return nil, fmt.Errorf("load cookies: %w", err)
-		}
-		c.log.Debug("cookies loaded", "count", n, "file", opts.CookiesFile)
-	}
+	c.env = env
 	if ff, err := postprocess.FindFFmpeg(opts.FFmpegLocation); err == nil {
 		c.ffmpeg = ff
 	} else if opts.FFmpegLocation != "" {
@@ -338,6 +289,125 @@ func buildCredStore(opts Options) (*extractor.CredStore, error) {
 	return store, nil
 }
 
+// buildEnv собирает окружение экстракторов (HTTP-клиент, cookies, имитацию,
+// учётные данные) из Options. Дорогие части (реестр, скрипты) передаются
+// отдельно и переиспользуются в Clone без повторной инициализации.
+func buildEnv(opts Options, reg *extractor.Registry, log *slog.Logger) (*extractor.Env, error) {
+	hc := opts.HTTPClient
+	if hc == nil {
+		var proxy *url.URL
+		if opts.Proxy != "" {
+			p, err := url.Parse(opts.Proxy)
+			if err != nil {
+				return nil, fmt.Errorf("invalid proxy: %w", err)
+			}
+			proxy = p
+		}
+		hc = extractor.DefaultHTTPClient(proxy)
+	}
+	hc = extractor.WithSocketTimeout(hc, opts.SocketTimeout)
+	ua := opts.UserAgent
+	if ua == "" {
+		ua = extractor.DefaultUserAgent
+	}
+	args := map[string]map[string][]string{}
+	for ie, kv := range opts.ExtractorArgs {
+		args[strings.ToLower(ie)] = kv
+	}
+	// Если пользователь берёт cookies из браузера, но не задал имитацию и
+	// User-Agent, по умолчанию имитируем тот же браузер. Защитные cookies
+	// (cf_clearance Cloudflare, datadome и т.п.) привязаны к TLS-отпечатку и
+	// User-Agent браузера, который их выдал; без совпадения сервер их не
+	// примет и снова покажет проверку. Это не обход проверки, а продолжение
+	// уже пройденной пользователем в его же браузере сессии.
+	imp := opts.Impersonate
+	if imp == "" && opts.CookiesFromBrowser != "" && opts.UserAgent == "" {
+		if t := browserImpersonate(opts.CookiesFromBrowser); t != "" {
+			imp = t
+			log.Debug("matching TLS/User-Agent to browser for its cookies", "impersonate", imp)
+		}
+	}
+	if imp != "" {
+		if _, err := impersonate.Lookup(imp); err != nil {
+			return nil, err
+		}
+	}
+	var proxyFn impersonate.ProxyFunc
+	if opts.Proxy != "" {
+		p, _ := url.Parse(opts.Proxy)
+		proxyFn = http.ProxyURL(p)
+	}
+	creds, err := buildCredStore(opts)
+	if err != nil {
+		return nil, err
+	}
+	env := &extractor.Env{
+		HTTP: hc, UserAgent: ua, Logger: log, Registry: reg,
+		Args: args, NoPlaylist: opts.NoPlaylist, MaxEntries: opts.PlaylistEnd,
+		Impersonate:   imp,
+		Impersonator:  &impersonate.Pool{Jar: hc.Jar, Proxy: proxyFn},
+		Creds:         creds,
+		SocketTimeout: opts.SocketTimeout,
+	}
+	if opts.CookiesFromBrowser != "" {
+		n, err := extractor.LoadCookiesFromBrowser(hc, opts.CookiesFromBrowser)
+		if err != nil {
+			return nil, fmt.Errorf("load browser cookies: %w", err)
+		}
+		log.Debug("browser cookies loaded", "count", n)
+	}
+	if opts.CookiesFile != "" {
+		n, err := extractor.LoadCookiesFile(hc, opts.CookiesFile)
+		if err != nil {
+			return nil, fmt.Errorf("load cookies: %w", err)
+		}
+		log.Debug("cookies loaded", "count", n, "file", opts.CookiesFile)
+	}
+	return env, nil
+}
+
+// Clone создаёт вариант клиента с изменёнными сетевыми настройками (cookies,
+// прокси, User-Agent, имитация браузера, NoPlaylist), переиспользуя уже
+// скомпилированные экстракторы, реестр, ffmpeg и merger — без повторной
+// установки JS-экстракторов (дорогой части New). Клон получает собственный
+// HTTP-клиент и cookie-jar, его cookie-сессия не пересекается с исходной.
+// Пустые строковые поля CloneOptions наследуются из исходного клиента.
+func (c *Client) Clone(o CloneOptions) (*Client, error) {
+	opts := c.opts
+	opts.HTTPClient = nil // клон всегда получает собственный клиент и jar
+	if o.CookiesFile != "" {
+		opts.CookiesFile = o.CookiesFile
+	}
+	if o.CookiesFromBrowser != "" {
+		opts.CookiesFromBrowser = o.CookiesFromBrowser
+	}
+	if o.UserAgent != "" {
+		opts.UserAgent = o.UserAgent
+	}
+	if o.Proxy != "" {
+		opts.Proxy = o.Proxy
+	}
+	if o.Impersonate != "" {
+		opts.Impersonate = o.Impersonate
+	}
+	if o.NoPlaylist != nil {
+		opts.NoPlaylist = *o.NoPlaylist
+	}
+	env, err := buildEnv(opts, c.reg, c.log)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{
+		opts:    opts,
+		reg:     c.reg,
+		scripts: c.scripts,
+		env:     env,
+		ffmpeg:  c.ffmpeg,
+		merger:  c.merger,
+		log:     c.log,
+	}, nil
+}
+
 // Registry возвращает реестр экстракторов клиента.
 func (c *Client) Registry() *extractor.Registry { return c.reg }
 
@@ -350,6 +420,56 @@ func (c *Client) Scripts() *script.Manager { return c.scripts }
 
 // Env возвращает окружение экстракторов.
 func (c *Client) Env() *extractor.Env { return c.env }
+
+// ExtractorsVersion — версия установленного пакета JS-экстракторов
+// (0 — встроенные скрипты или отсутствие пакета).
+func (c *Client) ExtractorsVersion() int64 { return c.scripts.Version() }
+
+// UpdateExtractors проверяет и устанавливает свежий подписанный пакет
+// JS-экстракторов (как CLI --update-extractors), используя HTTP-клиент и
+// логгер клиента, официальный URL и ключ подписи. cacheDir — каталог кеша
+// (пусто — без кеша). Возвращает true, если установлена новая версия.
+func (c *Client) UpdateExtractors(ctx context.Context, cacheDir string) (bool, error) {
+	u := &script.Updater{HTTP: c.env.HTTP, Logger: c.log, CacheDir: cacheDir}
+	return u.Check(ctx, c.scripts)
+}
+
+// CookieHeader возвращает значение заголовка Cookie для rawURL из cookie-jar
+// клиента в формате "name=value; name2=value2" или "", если подходящих
+// cookies нет. Полезно, чтобы передать внешнему плееру (mpv и т.п.) сессию
+// для потоков, которые отдаются только с cookies.
+func (c *Client) CookieHeader(rawURL string) string {
+	if c.env == nil || c.env.HTTP == nil || c.env.HTTP.Jar == nil {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	cs := c.env.HTTP.Jar.Cookies(u)
+	if len(cs) == 0 {
+		return ""
+	}
+	parts := make([]string, len(cs))
+	for i, ck := range cs {
+		parts[i] = ck.Name + "=" + ck.Value
+	}
+	return strings.Join(parts, "; ")
+}
+
+// addCookieHeader дописывает в h заголовок Cookie из jar, не затирая Cookie,
+// уже выставленный экстрактором.
+func (c *Client) addCookieHeader(h map[string]string, rawURL string) {
+	if h == nil {
+		return
+	}
+	if _, ok := h["Cookie"]; ok {
+		return
+	}
+	if v := c.CookieHeader(rawURL); v != "" {
+		h["Cookie"] = v
+	}
+}
 
 // HasFFmpeg сообщает, найден ли ffmpeg.
 func (c *Client) HasFFmpeg() bool { return c.ffmpeg != nil }
@@ -383,10 +503,27 @@ const maxURLDepth = 8
 // Extract извлекает информацию по URL, проходя KindURL-переадресации.
 // Элементы плейлиста не разворачиваются (см. Walk).
 func (c *Client) Extract(ctx context.Context, rawURL string) (*media.Info, error) {
-	return c.extract(ctx, rawURL, "", 0)
+	return c.extract(ctx, c.env, rawURL, "", 0)
 }
 
-func (c *Client) extract(ctx context.Context, rawURL, ieKey string, depth int) (*media.Info, error) {
+// ExtractWith — как Extract, но с переопределениями из req (сейчас —
+// NoPlaylist). URL берётся из req.URL.
+func (c *Client) ExtractWith(ctx context.Context, req Request) (*media.Info, error) {
+	return c.extract(ctx, c.envFor(req), req.URL, "", 0)
+}
+
+// envFor возвращает окружение с per-call переопределениями из req; без
+// переопределений — общее окружение клиента.
+func (c *Client) envFor(req Request) *extractor.Env {
+	if req.NoPlaylist == nil {
+		return c.env
+	}
+	e := *c.env
+	e.NoPlaylist = *req.NoPlaylist
+	return &e
+}
+
+func (c *Client) extract(ctx context.Context, env *extractor.Env, rawURL, ieKey string, depth int) (*media.Info, error) {
 	if depth > maxURLDepth {
 		return nil, fmt.Errorf("too many redirections between extractors for %s", rawURL)
 	}
@@ -404,7 +541,7 @@ func (c *Client) extract(ctx context.Context, rawURL, ieKey string, depth int) (
 		ie = e
 	}
 	c.log.Debug("extracting", "extractor", ie.Name(), "url", rawURL)
-	info, err := c.extractRetry(ctx, ie, rawURL)
+	info, err := c.extractRetry(ctx, env, ie, rawURL)
 	// экстрактор может отказаться от URL уже после проверки (например, PeerTube
 	// узнаёт инстанс только запросом к API) — тогда пробуем следующие по очереди
 	for tried := []string{ie.Name()}; err != nil && errors.Is(err, extractor.ErrUnsupportedURL); {
@@ -415,7 +552,7 @@ func (c *Client) extract(ctx context.Context, rawURL, ieKey string, depth int) (
 		tried = append(tried, next.Name())
 		c.log.Debug("extractor declined URL, trying next", "declined", ie.Name(), "next", next.Name())
 		ie = next
-		info, err = c.extractRetry(ctx, ie, rawURL)
+		info, err = c.extractRetry(ctx, env, ie, rawURL)
 	}
 	if err != nil {
 		return nil, err
@@ -424,7 +561,7 @@ func (c *Client) extract(ctx context.Context, rawURL, ieKey string, depth int) (
 		return nil, fmt.Errorf("[%s] extractor returned no result", ie.Name())
 	}
 	if info.Kind == media.KindURL {
-		inner, err := c.extract(ctx, info.URL, info.IEKey, depth+1)
+		inner, err := c.extract(ctx, env, info.URL, info.IEKey, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -435,9 +572,9 @@ func (c *Client) extract(ctx context.Context, rawURL, ieKey string, depth int) (
 	return info, nil
 }
 
-func (c *Client) extractRetry(ctx context.Context, ie extractor.Extractor, rawURL string) (*media.Info, error) {
+func (c *Client) extractRetry(ctx context.Context, env *extractor.Env, ie extractor.Extractor, rawURL string) (*media.Info, error) {
 	for attempt := 0; ; attempt++ {
-		info, err := ie.Extract(ctx, c.env, rawURL)
+		info, err := ie.Extract(ctx, env, rawURL)
 		var he *extractor.HTTPError
 		var ne net.Error
 		retry := errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &ne) ||
@@ -542,7 +679,7 @@ func (c *Client) Walk(ctx context.Context, info *media.Info, fn func(entry *medi
 		e.Playlist = info.Title
 		entry := e
 		if e.Kind == media.KindURL || (e.Kind == "" && len(e.Formats) == 0 && e.URL != "") {
-			resolved, err := c.extract(ctx, e.URL, e.IEKey, 1)
+			resolved, err := c.extract(ctx, c.env, e.URL, e.IEKey, 1)
 			if err != nil {
 				if ferr := fn(nil, fmt.Errorf("playlist item %d: %w", idx, err)); ferr != nil {
 					return ferr
@@ -771,8 +908,10 @@ func (c *Client) StreamLinksInfo(info *media.Info) ([]StreamLink, error) {
 			continue
 		}
 		seen[man] = true
+		h := info.Headers(f)
+		c.addCookieHeader(h, man)
 		links = append(links, StreamLink{
-			URL: man, Protocol: f.Protocol, Headers: info.Headers(f),
+			URL: man, Protocol: f.Protocol, Headers: h,
 			IsLive: info.IsLive || f.Live,
 		})
 	}
@@ -790,8 +929,10 @@ func (c *Client) StreamLinksInfo(info *media.Info) ([]StreamLink, error) {
 				continue
 			}
 			seen[f.URL] = true
+			h := info.Headers(f)
+			c.addCookieHeader(h, f.URL)
 			links = append(links, StreamLink{
-				URL: f.URL, Protocol: f.Protocol, Headers: info.Headers(f),
+				URL: f.URL, Protocol: f.Protocol, Headers: h,
 				IsLive: info.IsLive || f.Live, FormatID: f.FormatID, Note: f.FormatNote,
 			})
 		}
@@ -823,7 +964,7 @@ func (c *Client) Download(ctx context.Context, rawURL string) ([]Result, error) 
 // (свой колбэк прогресса, формат, каталог) — для параллельных загрузок одним
 // клиентом.
 func (c *Client) DownloadWith(ctx context.Context, req Request) ([]Result, error) {
-	info, err := c.Extract(ctx, req.URL)
+	info, err := c.ExtractWith(ctx, req)
 	if err != nil {
 		return nil, err
 	}
